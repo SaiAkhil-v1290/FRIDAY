@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 .env
 storage/*.db
+storage/screenshots/*
+!.gitkeep
 data/*.db
 data/jarvis.db
 logs/*

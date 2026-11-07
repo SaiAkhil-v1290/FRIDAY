@@ -3,6 +3,7 @@ from ai.schemas import TaskPlan, ProposedAction
 from tools.registry import is_registered_tool, TOOL_POLICIES
 from tools.application import launch_application, close_application, check_application_running
 from tools.browser import search_browser, get_browser_controller, BrowserActionResult
+from tools.desktop import get_desktop_controller, DesktopActionResult
 from tools.files import (
     discover_files,
     FileSearchResult,
@@ -28,6 +29,17 @@ IMPLEMENTED_EXECUTION_TOOLS = {
     "browser_go_forward",
     "browser_refresh",
     "browser_get_page_info",
+    "browser_get_page_content",
+    "browser_get_visible_links",
+    "read_screen",
+    "capture_screen",
+    "describe_screen",
+    "move_mouse",
+    "click_mouse",
+    "scroll_mouse",
+    "type_text",
+    "press_key",
+    "hotkey",
     "find_files",
     "search_file_contents",
     "open_file",
@@ -306,6 +318,163 @@ class PlanExecutor:
                     success=nav_res.success,
                     message=nav_res.message,
                     error=nav_res.error,
+                )
+
+            elif tool_name == "browser_get_page_content":
+                ctrl = get_browser_controller()
+                nav_res = ctrl.get_page_content()
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=nav_res.success,
+                    message=nav_res.message,
+                    error=nav_res.error,
+                )
+
+            elif tool_name == "browser_get_visible_links":
+                ctrl = get_browser_controller()
+                nav_res = ctrl.get_visible_links()
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=nav_res.success,
+                    message=nav_res.message,
+                    error=nav_res.error,
+                )
+
+            elif tool_name in {"read_screen", "capture_screen"}:
+                save_screenshot = args.get("save", True)
+                desk = get_desktop_controller()
+                d_res = desk.capture_screen(save=save_screenshot)
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=d_res.success,
+                    message=d_res.message,
+                    error=d_res.error,
+                )
+
+            elif tool_name == "describe_screen":
+                desk = get_desktop_controller()
+                d_res = desk.describe_screen()
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=d_res.success,
+                    message=d_res.message,
+                    error=d_res.error,
+                )
+
+            elif tool_name == "move_mouse":
+                desk = get_desktop_controller()
+                x_coord = args.get("x")
+                y_coord = args.get("y")
+                if x_coord is None or y_coord is None:
+                    return ActionExecutionResult(
+                        action_name=tool_name,
+                        arguments=args,
+                        executed=True,
+                        success=False,
+                        message="Missing 'x' or 'y' coordinates for move_mouse.",
+                        error="MISSING_ARGUMENT",
+                    )
+                try:
+                    x_int = int(x_coord)
+                    y_int = int(y_coord)
+                except (ValueError, TypeError):
+                    return ActionExecutionResult(
+                        action_name=tool_name,
+                        arguments=args,
+                        executed=True,
+                        success=False,
+                        message=f"Coordinates must be integers, got ({x_coord}, {y_coord}).",
+                        error="INVALID_COORDINATES",
+                    )
+                d_res = desk.move_mouse(x_int, y_int)
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=d_res.success,
+                    message=d_res.message,
+                    error=d_res.error,
+                )
+
+            elif tool_name == "click_mouse":
+                desk = get_desktop_controller()
+                x_coord = args.get("x")
+                y_coord = args.get("y")
+                button = args.get("button", "left")
+                double = bool(args.get("double", False))
+                x_int = int(x_coord) if x_coord is not None else None
+                y_int = int(y_coord) if y_coord is not None else None
+                d_res = desk.click_mouse(x=x_int, y=y_int, button=button, double=double)
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=d_res.success,
+                    message=d_res.message,
+                    error=d_res.error,
+                )
+
+            elif tool_name == "scroll_mouse":
+                desk = get_desktop_controller()
+                direction = args.get("direction", "down")
+                amount = int(args.get("amount", 3))
+                d_res = desk.scroll_mouse(direction=direction, amount=amount)
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=d_res.success,
+                    message=d_res.message,
+                    error=d_res.error,
+                )
+
+            elif tool_name == "type_text":
+                desk = get_desktop_controller()
+                text_content = args.get("text", "")
+                d_res = desk.type_text(str(text_content))
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=d_res.success,
+                    message=d_res.message,
+                    error=d_res.error,
+                )
+
+            elif tool_name == "press_key":
+                desk = get_desktop_controller()
+                key_name = args.get("key", "")
+                d_res = desk.press_key(str(key_name))
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=d_res.success,
+                    message=d_res.message,
+                    error=d_res.error,
+                )
+
+            elif tool_name == "hotkey":
+                desk = get_desktop_controller()
+                keys = args.get("keys", [])
+                if isinstance(keys, str):
+                    keys = [k.strip() for k in keys.split("+")]
+                d_res = desk.hotkey(*keys)
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=True,
+                    success=d_res.success,
+                    message=d_res.message,
+                    error=d_res.error,
                 )
 
             elif tool_name == "find_files":

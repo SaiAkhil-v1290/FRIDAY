@@ -8,6 +8,7 @@ from ai.intent import (
     extract_conversational_application_action,
     extract_browser_navigation_target,
     extract_browser_control_action,
+    extract_desktop_control_action,
     extract_explicit_open_file_target,
     extract_explicit_open_folder_target,
     extract_multi_step_actions,
@@ -20,6 +21,7 @@ from ai.intent import (
 )
 from tools.application import resolve_application
 from tools.browser import validate_and_normalize_url, get_browser_controller
+from tools.desktop import get_desktop_controller
 from tools.files import discover_files, search_file_contents, resolve_safe_root
 import re
 from ai.conversation import ConversationManager
@@ -530,6 +532,25 @@ class JarvisOrchestrator:
                             requires_approval=False,
                             reason="Retrieve current browser page info",
                         ))
+                    elif tool_n in {
+                        "browser_get_page_content",
+                        "browser_get_visible_links",
+                        "read_screen",
+                        "capture_screen",
+                        "describe_screen",
+                        "move_mouse",
+                        "click_mouse",
+                        "scroll_mouse",
+                        "type_text",
+                        "press_key",
+                        "hotkey",
+                    }:
+                        plan_actions.append(ProposedAction(
+                            tool=tool_n,
+                            arguments=args,
+                            requires_approval=False,
+                            reason=f"Execute desktop/computer control action: {tool_n}",
+                        ))
 
                 if plan_actions:
                     plan_msg = f"Executing {len(plan_actions)} requested actions in sequence."
@@ -571,6 +592,33 @@ class JarvisOrchestrator:
             conv_app_action = extract_conversational_application_action(user_text)
             browser_control_action = extract_browser_control_action(user_text)
             browser_nav_target = extract_browser_navigation_target(user_text)
+            desktop_control_action = extract_desktop_control_action(user_text)
+
+            # Check desktop control action (Phase 3: screenshot, screen description, mouse, keyboard)
+            if desktop_control_action is not None:
+                d_action_name = desktop_control_action["action"]
+                d_action_args = desktop_control_action.get("arguments", {})
+                raw_plan = TaskPlan(
+                    intent=d_action_name,
+                    message=f"Executing {d_action_name}.",
+                    actions=[
+                        ProposedAction(
+                            tool=d_action_name,
+                            arguments=d_action_args,
+                            requires_approval=False,
+                            reason=f"User requested computer control action: {d_action_name}",
+                        )
+                    ],
+                )
+                plan = validate_plan(raw_plan, current_request=user_text)
+                exec_res = self.executor.execute_plan(plan, allow_approved=allow_approved)
+                final_msg = plan.message
+                if exec_res and exec_res.results:
+                    final_msg = exec_res.results[0].message
+
+                self.memory.add("user", user_text, category=intent)
+                self.memory.add("assistant", final_msg, category=intent, plan=plan)
+                return AssistantResult(message=final_msg, plan=plan, execution_result=exec_res)
 
             # Check browser control action (Milestone 5.1: go back, forward, refresh, page info)
             if browser_control_action is not None:

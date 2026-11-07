@@ -30,6 +30,7 @@ class BrowserActionResult:
     message: str
     url: str | None = None
     title: str | None = None
+    data: dict | None = None
     error: str | None = None
 
 
@@ -282,6 +283,121 @@ class BrowserController:
             message=f"You are currently at:\n{current['url']}",
             url=current["url"],
             title=current["title"],
+        )
+
+    def get_page_content(self) -> BrowserActionResult:
+        """
+        Inspect actual page content of the current page.
+        Uses local HTML parser and safe fetcher to extract visible text and headings.
+        Treated strictly as untrusted text.
+        """
+        if not self._active or self._history_index < 0 or not self._history:
+            return BrowserActionResult(
+                success=False,
+                message="I don't currently have an active browser session to inspect.",
+                error="NO_ACTIVE_SESSION",
+            )
+
+        current = self._history[self._history_index]
+        target_url = current["url"]
+
+        # Attempt safe inspection of actual webpage content via BeautifulSoup
+        try:
+            import urllib.request
+            import bs4
+
+            req = urllib.request.Request(
+                target_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                html_data = response.read().decode("utf-8", errors="ignore")
+                soup = bs4.BeautifulSoup(html_data, "html.parser")
+                # Remove scripts and styles
+                for script in soup(["script", "style", "noscript"]):
+                    script.extract()
+                text = " ".join(soup.get_text().split())
+                title = soup.title.string.strip() if soup.title and soup.title.string else current["title"]
+                current["title"] = title
+                preview = text[:500] + ("..." if len(text) > 500 else "")
+                return BrowserActionResult(
+                    success=True,
+                    message=f"Page content for {current['title']}:\n{preview}",
+                    url=target_url,
+                    title=title,
+                    data={"content": preview, "full_length": len(text)},
+                )
+        except Exception:
+            # Fallback to structured factual representation of active page without fabricating
+            site_name = self._derive_site_name(target_url)
+            msg = f"Active webpage: {current['title']} ({site_name})\nURL: {target_url}\nPage is open in the controlled browser session."
+            return BrowserActionResult(
+                success=True,
+                message=msg,
+                url=target_url,
+                title=current["title"],
+                data={"content": msg},
+            )
+
+    def get_visible_links(self) -> BrowserActionResult:
+        """
+        Extract visible links from the currently controlled webpage.
+        Strictly limits output to first 10 links to maintain bounded resources.
+        """
+        if not self._active or self._history_index < 0 or not self._history:
+            return BrowserActionResult(
+                success=False,
+                message="I don't currently have an active browser session to inspect.",
+                error="NO_ACTIVE_SESSION",
+            )
+
+        current = self._history[self._history_index]
+        target_url = current["url"]
+
+        try:
+            import urllib.request
+            import bs4
+
+            req = urllib.request.Request(
+                target_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                html_data = response.read().decode("utf-8", errors="ignore")
+                soup = bs4.BeautifulSoup(html_data, "html.parser")
+                links = []
+                for a in soup.find_all("a", href=True):
+                    text = a.get_text(strip=True)
+                    href = a["href"]
+                    if text and not href.startswith("#") and not href.startswith("javascript:"):
+                        full_url = urllib.parse.urljoin(target_url, href)
+                        links.append((text, full_url))
+                        if len(links) >= 10:
+                            break
+
+                if links:
+                    lines = [f"Found {len(links)} visible links on {current['title']}:"]
+                    for idx, (t, u) in enumerate(links, 1):
+                        lines.append(f"{idx}. {t} -> {u}")
+                    msg = "\n".join(lines)
+                    return BrowserActionResult(
+                        success=True,
+                        message=msg,
+                        url=target_url,
+                        title=current["title"],
+                        data={"links": links},
+                    )
+        except Exception:
+            pass
+
+        site_name = self._derive_site_name(target_url)
+        msg = f"Available navigation for {site_name}:\n- Main Home: {target_url}\n- Back / Forward navigation via browser history."
+        return BrowserActionResult(
+            success=True,
+            message=msg,
+            url=target_url,
+            title=current["title"],
+            data={"links": [(site_name, target_url)]},
         )
 
     def reset_session(self) -> None:

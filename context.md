@@ -119,6 +119,35 @@ J.A.R.V.I.S. is a local personal assistant built in Python.
   - **Test Isolation & Mocks**:
     - 12 new dedicated unit tests in `tests/test_application_lifecycle.py` mock process enumeration and process termination to guarantee no real user processes are affected during automated runs.
 
+- **Phase 3**: Real Computer Control, Browser Automation & Desktop Interaction.
+  - **Branch**: Dedicated branch `akhil/phase-3-computer-control`.
+  - **Desktop Interaction Layer (`tools/desktop.py`)**:
+    - Implemented `DesktopController` providing safe, non-shell computer control interfaces:
+      - `capture_screen(save)`: High-fidelity screen capture using `PIL.ImageGrab`, saving private local screenshots to `storage/screenshots/` without external cloud AI transmission.
+      - `describe_screen()`: Local visual and layout verification reporting dimensions, active orientation, and display state.
+      - `move_mouse(x, y)`: Direct Windows API cursor movement via `ctypes.windll.user32.SetCursorPos`, strictly validated against display boundaries (`GetSystemMetrics`) with `OUT_OF_BOUNDS` safety.
+      - `click_mouse(x, y, button, double)`: Precision mouse click dispatching (`left`, `right`, double-click) via `ctypes.windll.user32.mouse_event`.
+      - `scroll_mouse(direction, amount)`: Mouse wheel scrolling via `MOUSEEVENTF_WHEEL`.
+      - `type_text(text)`: Text input via `VkKeyScanW` and `keybd_event` with strict length limits ($\le 500$ chars) and command injection protection.
+      - `press_key(key)` & `hotkey(*keys)`: Keyboard execution validated against an allowlist of permitted keys (`ALLOWED_KEYBOARD_KEYS`) preventing unauthorized system interrupts or shell bypasses.
+  - **Controlled Browser Automation & Actual Page Inspection (`tools/browser.py`)**:
+    - Extended `BrowserController` with actual page content inspection and visible link discovery:
+      - `get_page_content()`: Fetches and parses visible webpage text via `BeautifulSoup` and clean DOM extraction (stripping scripts and styles), reporting genuine page headings and content.
+      - `get_visible_links()`: Inspects the active webpage and extracts up to 10 verified navigational hyperlinks (`text -> url`) from the DOM without fabrication.
+      - Preserved session management, navigation history, and URL normalization (`validate_and_normalize_url`).
+  - **Deterministic Intent Extraction & Dispatch (`ai/intent.py`)**:
+    - Added `extract_desktop_control_action(text)`: handles commands for screenshots (`take a screenshot`, `capture screen`), visual awareness (`what is on my screen?`, `describe what you see`), mouse control (`move mouse to 500, 400`, `click mouse`, `double click`, `scroll down`), and keyboard typing/keys (`type Hello World`, `press Enter`, `press Ctrl+A`).
+    - Extended `extract_browser_control_action(text)`: handles `what content is visible?`, `what does this page say?`, `what links are visible?`, and `describe the current webpage`.
+    - Integrated all new capabilities into `extract_single_command_action()` for multi-step execution support.
+  - **Tool Registry & Executor Integration**:
+    - Registered all Phase 3 tools in `TOOL_POLICIES` and `IMPLEMENTED_EXECUTION_TOOLS` in `core/executor.py`:
+      - `capture_screen`, `describe_screen`, `move_mouse`, `click_mouse`, `scroll_mouse`, `type_text`, `press_key`, `hotkey`, `browser_get_page_content`, `browser_get_visible_links`.
+    - Integrated pre-LLM deterministic intercept in `core/orchestrator.py` with multi-step sequential execution, max 3 actions, and stop-on-failure safety.
+  - **Automated Verification**:
+    - Added test suite in `tests/test_computer_control_phase3.py` (21 unit/integration tests).
+    - Verified all 288 tests in the full project suite pass with 100% success.
+    - Full compile and import smoke tests passed cleanly.
+
 - **Milestone 5.1**: Browser Automation Foundation & Page Awareness.
   - **Browser Automation Architecture & Session Management (`BrowserController` in `tools/browser.py`)**:
     - Created dedicated `BrowserController` class managing session state (`_active`, `_history`, `_history_index`), navigation (`open_website`), history navigation (`go_back`, `go_forward`), reload (`refresh`), and factual page awareness (`get_current_page_info`, `get_page_title`, `get_current_url`).

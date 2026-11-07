@@ -1684,8 +1684,137 @@ def extract_browser_control_action(text: str) -> dict[str, object] | None:
         "which page am i on",
         "tell me what page i am on",
         "tell me what website i am on",
+        "describe the current webpage",
+        "describe this page",
+        "what page is this",
     }:
         return {"action": "browser_get_page_info", "type": "page_info"}
+
+    # 7. Page content queries (Phase 3)
+    if norm in {
+        "what content is visible",
+        "what is on this page",
+        "what content is on this page",
+        "read this page",
+        "read page content",
+        "get page content",
+        "show page content",
+        "what does this page say",
+    }:
+        return {"action": "browser_get_page_content"}
+
+    # 8. Page links queries (Phase 3)
+    if norm in {
+        "what links are visible",
+        "what links are available",
+        "what links are on this page",
+        "show links",
+        "list links",
+        "get visible links",
+        "get links",
+    }:
+        return {"action": "browser_get_visible_links"}
+
+    return None
+
+
+def extract_desktop_control_action(text: str) -> dict[str, object] | None:
+    """
+    Deterministically detect desktop, screen, mouse, and keyboard interaction commands (Phase 3).
+    Supported actions:
+    - capture_screen / take a screenshot
+    - describe_screen / what is on my screen
+    - move_mouse (e.g. move mouse to 500, 500)
+    - click_mouse (e.g. click mouse, double click, right click)
+    - scroll_mouse (e.g. scroll down, scroll up)
+    - type_text (e.g. type Hello World)
+    - press_key (e.g. press Enter, press Esc)
+    - hotkey (e.g. press Ctrl+A)
+    """
+    cleaned = text.strip()
+    norm = " ".join(cleaned.lower().rstrip("?.!").split())
+
+    if any(re.search(pat, norm) for pat in INJECTION_PATTERNS):
+        return None
+    if extract_explicit_search_query(text) is not None:
+        return None
+
+    # 1. Screen capture
+    if norm in {
+        "take a screenshot",
+        "take screenshot",
+        "capture screen",
+        "capture the screen",
+        "screenshot",
+        "save a screenshot",
+        "take a picture of my screen",
+    }:
+        return {"action": "capture_screen", "arguments": {}}
+
+    # 2. Describe screen / Visual awareness
+    if norm in {
+        "what is on my screen",
+        "what's on my screen",
+        "describe what you see",
+        "describe my screen",
+        "what is currently on my screen",
+        "describe the screen",
+        "look at my screen",
+    }:
+        return {"action": "describe_screen", "arguments": {}}
+
+    # 3. Move mouse: "move mouse to 500, 300" or "move mouse to (500, 300)" or "move mouse to center"
+    m_move = re.match(r"^(?:please\s+)?(?:move\s+(?:the\s+)?mouse|move\s+cursor)\s+(?:to\s+)?(?:\(?(\d+)\s*[,x\s]\s*(\d+)\)?|center|middle)$", norm, re.IGNORECASE)
+    if m_move:
+        x_str, y_str = m_move.group(1), m_move.group(2)
+        if x_str and y_str:
+            return {"action": "move_mouse", "arguments": {"x": int(x_str), "y": int(y_str)}}
+        elif "center" in norm or "middle" in norm:
+            # Default center
+            return {"action": "move_mouse", "arguments": {"x": 960, "y": 540}}
+
+    # 4. Mouse click
+    if norm in {"click mouse", "click", "left click", "click the mouse", "click here"}:
+        return {"action": "click_mouse", "arguments": {"button": "left", "double": False}}
+    if norm in {"double click", "double-click", "double click mouse"}:
+        return {"action": "click_mouse", "arguments": {"button": "left", "double": True}}
+    if norm in {"right click", "right-click", "right click mouse"}:
+        return {"action": "click_mouse", "arguments": {"button": "right", "double": False}}
+
+    m_click_at = re.match(r"^(?:please\s+)?(?:click\s+(?:at\s+)?|click\s+mouse\s+at\s+)\(?(\d+)\s*[,x\s]\s*(\d+)\)?$", norm, re.IGNORECASE)
+    if m_click_at:
+        return {"action": "click_mouse", "arguments": {"x": int(m_click_at.group(1)), "y": int(m_click_at.group(2)), "button": "left", "double": False}}
+
+    # 5. Scroll mouse: "scroll down", "scroll up"
+    if norm in {"scroll down", "scroll down the page", "scroll page down"}:
+        return {"action": "scroll_mouse", "arguments": {"direction": "down", "amount": 3}}
+    if norm in {"scroll up", "scroll up the page", "scroll page up"}:
+        return {"action": "scroll_mouse", "arguments": {"direction": "up", "amount": 3}}
+
+    # 6. Type text: "type <text>"
+    m_type = re.match(r"^(?:please\s+)?type\s+(.+)$", cleaned, re.IGNORECASE)
+    if m_type:
+        typed = m_type.group(1).strip().strip("'\"")
+        # Ensure it is not a file/application command e.g. "type of file is it"
+        if not typed.lower().startswith("of file"):
+            return {"action": "type_text", "arguments": {"text": typed}}
+
+    # 7. Press hotkey: "press ctrl+a", "press ctrl+c", "copy the selected text"
+    m_hotkey = re.match(r"^(?:please\s+)?press\s+([a-zA-Z0-9]+)\s*\+\s*([a-zA-Z0-9]+)$", norm, re.IGNORECASE)
+    if m_hotkey:
+        k1, k2 = m_hotkey.group(1), m_hotkey.group(2)
+        return {"action": "hotkey", "arguments": {"keys": [k1, k2]}}
+
+    if norm in {"copy the selected text", "copy selected text", "copy that"}:
+        return {"action": "hotkey", "arguments": {"keys": ["ctrl", "c"]}}
+
+    # 8. Press key: "press enter", "press esc", "press tab", "press space"
+    m_key = re.match(r"^(?:please\s+)?press\s+([a-zA-Z0-9]+)$", norm, re.IGNORECASE)
+    if m_key:
+        key_n = m_key.group(1)
+        from tools.desktop import ALLOWED_KEYBOARD_KEYS
+        if key_n.lower() in ALLOWED_KEYBOARD_KEYS:
+            return {"action": "press_key", "arguments": {"key": key_n}}
 
     return None
 
@@ -1769,7 +1898,12 @@ def extract_single_command_action(segment: str) -> dict[str, object] | None:
         action_name = conv_app_action["action"]
         return {"tool": action_name, "conversational_reference": conv_app_action["reference"]}
 
-    # 9. Check open file
+    # 9. Check desktop control action (Phase 3: screen capture, describe screen, mouse, keyboard)
+    desk_action = extract_desktop_control_action(s)
+    if desk_action is not None:
+        return {"tool": desk_action["action"], "arguments": desk_action.get("arguments", {})}
+
+    # 10. Check open file
     file_target = extract_explicit_open_file_target(s)
     if file_target is not None:
         return {"tool": "open_file", "target_info": file_target}
@@ -1886,10 +2020,14 @@ def classify_intent(text: str) -> IntentCategory:
     if extract_explicit_search_query(raw) is not None:
         return "task"
 
-    # 4g. Explicit browser navigation or control commands (Milestone 5.1)
+    # 4g. Explicit browser navigation or control commands (Milestone 5.1 & Phase 3)
     if extract_browser_navigation_target(raw) is not None:
         return "task"
     if extract_browser_control_action(raw) is not None:
+        return "task"
+
+    # 4h. Explicit desktop interaction commands (Phase 3: screenshot, screen description, mouse, keyboard)
+    if extract_desktop_control_action(raw) is not None:
         return "task"
 
     # 5. Explicit memory commands

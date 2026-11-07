@@ -1,15 +1,26 @@
 """
-Comprehensive tests for Phase 3: Real Computer Control, Browser Automation & Desktop Interaction.
+Comprehensive tests for Phase 3 and Phase 3.1:
+Real Computer Control, Hardened Browser Automation & Visual Awareness.
+All Windows API input dispatches are strictly mocked in unit tests to ensure
+no real mouse movements or keystrokes occur during test execution.
 """
 
 import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
+from PIL import Image
 
-from tools.desktop import DesktopController, get_desktop_controller, ALLOWED_KEYBOARD_KEYS
+from tools.desktop import (
+    DesktopController,
+    get_desktop_controller,
+    ALLOWED_KEYBOARD_KEYS,
+    ALLOWED_MOUSE_BUTTONS,
+    ALLOWED_SCROLL_DIRECTIONS,
+)
 from tools.browser import get_browser_controller
 from core.orchestrator import JarvisOrchestrator
 from core.executor import PlanExecutor
+from ai.schemas import TaskPlan, ProposedAction
 
 
 class TestComputerControlPhase3(unittest.TestCase):
@@ -24,68 +35,132 @@ class TestComputerControlPhase3(unittest.TestCase):
         self.browser_ctrl.reset()
 
     # -------------------------------------------------------------
-    # 1. Desktop Controller Unit Tests
+    # 1. Desktop Controller Unit Tests (Mocked API calls for safety)
     # -------------------------------------------------------------
 
-    def test_screen_dimensions(self):
+    @patch("ctypes.windll.user32.GetSystemMetrics")
+    def test_screen_dimensions(self, mock_metrics):
+        mock_metrics.side_effect = lambda code: 1920 if code == 0 else 1080
         w, h = self.desktop_ctrl.get_screen_dimensions()
-        self.assertGreater(w, 0)
-        self.assertGreater(h, 0)
+        self.assertEqual(w, 1920)
+        self.assertEqual(h, 1080)
 
-    def test_mouse_position(self):
+    @patch("ctypes.windll.user32.GetCursorPos")
+    def test_mouse_position(self, mock_get_pos):
+        def fill_point(pt_ref):
+            pt_ref._obj.x = 250
+            pt_ref._obj.y = 350
+            return 1
+        mock_get_pos.side_effect = fill_point
         x, y = self.desktop_ctrl.get_mouse_position()
-        self.assertIsInstance(x, int)
-        self.assertIsInstance(y, int)
+        self.assertEqual(x, 250)
+        self.assertEqual(y, 350)
 
-    def test_move_mouse_valid_and_out_of_bounds(self):
-        w, h = self.desktop_ctrl.get_screen_dimensions()
+    @patch("ctypes.windll.user32.GetSystemMetrics")
+    @patch("ctypes.windll.user32.SetCursorPos")
+    @patch("tools.desktop.DesktopController.get_mouse_position")
+    def test_move_mouse_valid_and_out_of_bounds(self, mock_get_pos, mock_set_pos, mock_metrics):
+        mock_metrics.side_effect = lambda code: 1920 if code == 0 else 1080
+        mock_set_pos.return_value = 1
+        mock_get_pos.return_value = (100, 100)
+
         # Valid move
         res_valid = self.desktop_ctrl.move_mouse(100, 100)
         self.assertTrue(res_valid.success)
         self.assertTrue(res_valid.verified)
+        mock_set_pos.assert_called_with(100, 100)
 
         # Invalid out-of-bounds move
-        res_invalid = self.desktop_ctrl.move_mouse(w + 1000, h + 1000)
+        res_invalid = self.desktop_ctrl.move_mouse(3000, 2000)
+        self.assertFalse(res_valid == res_invalid)
         self.assertFalse(res_invalid.success)
         self.assertEqual(res_invalid.error, "OUT_OF_BOUNDS")
 
-    def test_mouse_clicks(self):
+        # Invalid coordinate types
+        res_bad_coords = self.desktop_ctrl.move_mouse("invalid", 100)
+        self.assertFalse(res_bad_coords.success)
+        self.assertEqual(res_bad_coords.error, "INVALID_COORDINATES")
+
+    @patch("ctypes.windll.user32.mouse_event")
+    @patch("tools.desktop.DesktopController.move_mouse")
+    def test_mouse_clicks_and_validation(self, mock_move, mock_mouse_event):
+        mock_move.return_value = MagicMock(success=True)
+
+        # Left click
         res_click = self.desktop_ctrl.click_mouse(100, 100, button="left", double=False)
         self.assertTrue(res_click.success)
         self.assertTrue(res_click.verified)
+        self.assertTrue(mock_mouse_event.called)
 
+        # Double click
+        mock_mouse_event.reset_mock()
         res_double = self.desktop_ctrl.click_mouse(100, 100, button="left", double=True)
         self.assertTrue(res_double.success)
+        self.assertEqual(mock_mouse_event.call_count, 4)  # 2 down, 2 up
 
+        # Right click
         res_right = self.desktop_ctrl.click_mouse(100, 100, button="right", double=False)
         self.assertTrue(res_right.success)
 
-    def test_mouse_scroll(self):
+        # Middle click
+        res_mid = self.desktop_ctrl.click_mouse(100, 100, button="middle", double=False)
+        self.assertTrue(res_mid.success)
+
+        # Invalid button validation
+        res_invalid_btn = self.desktop_ctrl.click_mouse(100, 100, button="invalid_button")
+        self.assertFalse(res_invalid_btn.success)
+        self.assertEqual(res_invalid_btn.error, "INVALID_BUTTON")
+
+    @patch("ctypes.windll.user32.mouse_event")
+    def test_mouse_scroll_and_validation(self, mock_mouse_event):
+        # Valid down scroll
         res_down = self.desktop_ctrl.scroll_mouse(direction="down", amount=3)
         self.assertTrue(res_down.success)
+        self.assertTrue(res_down.verified)
 
+        # Valid up scroll
         res_up = self.desktop_ctrl.scroll_mouse(direction="up", amount=2)
         self.assertTrue(res_up.success)
 
-    def test_type_text(self):
-        res = self.desktop_ctrl.type_text("Hello World")
+        # Invalid direction
+        res_inv_dir = self.desktop_ctrl.scroll_mouse(direction="sideways", amount=3)
+        self.assertFalse(res_inv_dir.success)
+        self.assertEqual(res_inv_dir.error, "INVALID_DIRECTION")
+
+        # Out-of-bounds amount (> 20 or < 1)
+        res_too_high = self.desktop_ctrl.scroll_mouse(direction="down", amount=100)
+        self.assertFalse(res_too_high.success)
+        self.assertEqual(res_too_high.error, "OUT_OF_BOUNDS")
+
+        res_too_low = self.desktop_ctrl.scroll_mouse(direction="down", amount=0)
+        self.assertFalse(res_too_low.success)
+        self.assertEqual(res_too_low.error, "OUT_OF_BOUNDS")
+
+    @patch("ctypes.windll.user32.keybd_event")
+    @patch("ctypes.windll.user32.VkKeyScanW", return_value=0x41)
+    def test_type_text(self, mock_vk, mock_keybd):
+        res = self.desktop_ctrl.type_text("Hello")
         self.assertTrue(res.success)
-        self.assertEqual(res.data["length"], 11)
+        self.assertTrue(res.verified)
+        self.assertEqual(res.data["length"], 5)
+        self.assertTrue(mock_keybd.called)
 
         # Empty text
         res_empty = self.desktop_ctrl.type_text("")
         self.assertFalse(res_empty.success)
         self.assertEqual(res_empty.error, "EMPTY_TEXT")
 
-        # Exceeds limit
+        # Exceeds limit (> 500 chars)
         long_text = "a" * 501
         res_long = self.desktop_ctrl.type_text(long_text)
         self.assertFalse(res_long.success)
         self.assertEqual(res_long.error, "TEXT_TOO_LONG")
 
-    def test_press_key(self):
+    @patch("ctypes.windll.user32.keybd_event")
+    def test_press_key(self, mock_keybd):
         res_enter = self.desktop_ctrl.press_key("enter")
         self.assertTrue(res_enter.success)
+        self.assertTrue(res_enter.verified)
 
         res_esc = self.desktop_ctrl.press_key("esc")
         self.assertTrue(res_esc.success)
@@ -95,17 +170,26 @@ class TestComputerControlPhase3(unittest.TestCase):
         self.assertFalse(res_invalid.success)
         self.assertEqual(res_invalid.error, "UNSUPPORTED_KEY")
 
-    def test_hotkey(self):
+    @patch("ctypes.windll.user32.keybd_event")
+    @patch("ctypes.windll.user32.VkKeyScanW", return_value=0x41)
+    def test_hotkey(self, mock_vk, mock_keybd):
         res_hotkey = self.desktop_ctrl.hotkey("ctrl", "a")
         self.assertTrue(res_hotkey.success)
+        self.assertTrue(res_hotkey.verified)
 
         res_empty = self.desktop_ctrl.hotkey()
         self.assertFalse(res_empty.success)
+        self.assertEqual(res_empty.error, "EMPTY_KEYS")
 
         res_invalid = self.desktop_ctrl.hotkey("ctrl", "nonexistent_key_123")
         self.assertFalse(res_invalid.success)
+        self.assertEqual(res_invalid.error, "UNSUPPORTED_KEY")
 
-    def test_capture_and_describe_screen(self):
+    @patch("PIL.ImageGrab.grab")
+    def test_capture_and_describe_screen(self, mock_grab):
+        fake_img = Image.new("RGB", (1920, 1080), color="blue")
+        mock_grab.return_value = fake_img
+
         res_cap = self.desktop_ctrl.capture_screen(save=True)
         self.assertTrue(res_cap.success)
         self.assertTrue(res_cap.verified)
@@ -113,14 +197,23 @@ class TestComputerControlPhase3(unittest.TestCase):
 
         res_desc = self.desktop_ctrl.describe_screen()
         self.assertTrue(res_desc.success)
-        self.assertIn("Screen captured successfully", res_desc.message)
+        self.assertTrue(res_desc.verified)
+        self.assertIn("1920x1080 resolution", res_desc.message)
+        self.assertIn("landscape", res_desc.message)
+        self.assertIn("local vision-language model", res_desc.message)
 
     # -------------------------------------------------------------
     # 2. Browser Advanced Inspection Unit Tests
     # -------------------------------------------------------------
 
+    @patch("urllib.request.urlopen")
     @patch("webbrowser.open", return_value=True)
-    def test_browser_page_content_and_links(self, mock_open):
+    def test_browser_page_content_and_links(self, mock_open, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"<html><head><title>Google</title></head><body><h1>Google</h1><a href='https://google.com/about'>About</a></body></html>"
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_response
+
         self.browser_ctrl.open_website("google")
         res_content = self.browser_ctrl.get_page_content()
         self.assertTrue(res_content.success)
@@ -140,56 +233,74 @@ class TestComputerControlPhase3(unittest.TestCase):
         self.assertEqual(res_links.error, "NO_ACTIVE_SESSION")
 
     # -------------------------------------------------------------
-    # 3. Orchestrator Integration Tests
+    # 3. Approval Requirement Policy Gating Tests
     # -------------------------------------------------------------
 
-    def test_orchestrator_capture_screen(self):
+    def test_consequential_computer_control_requires_approval(self):
+        executor = PlanExecutor()
+        consequential_actions = [
+            ("click_mouse", {"x": 100, "y": 100}),
+            ("type_text", {"text": "Hello"}),
+            ("press_key", {"key": "enter"}),
+            ("hotkey", {"keys": ["ctrl", "a"]}),
+        ]
+        for tool, args in consequential_actions:
+            action = ProposedAction(
+                tool=tool,
+                arguments=args,
+                requires_approval=False,
+                reason="test",
+            )
+            # Default allow_approved=False should block execution
+            res = executor.execute_action(action, allow_approved=False)
+            self.assertFalse(res.executed)
+            self.assertEqual(res.error, "APPROVAL_REQUIRED")
+            self.assertTrue(res.requires_approval)
+
+    # -------------------------------------------------------------
+    # 4. Orchestrator Integration Tests
+    # -------------------------------------------------------------
+
+    @patch("PIL.ImageGrab.grab")
+    def test_orchestrator_capture_screen(self, mock_grab):
+        mock_grab.return_value = Image.new("RGB", (1920, 1080), color="red")
         res = self.orchestrator.handle("Take a screenshot")
         self.assertEqual(res.plan.actions[0].tool, "capture_screen")
         self.assertTrue(res.execution_result.results[0].success)
 
-    def test_orchestrator_describe_screen(self):
+    @patch("PIL.ImageGrab.grab")
+    def test_orchestrator_describe_screen(self, mock_grab):
+        mock_grab.return_value = Image.new("RGB", (1920, 1080), color="green")
         res = self.orchestrator.handle("What is on my screen?")
         self.assertEqual(res.plan.actions[0].tool, "describe_screen")
         self.assertTrue(res.execution_result.results[0].success)
         self.assertIn("Screen captured successfully", res.message)
 
-    def test_orchestrator_move_mouse(self):
+    @patch("tools.desktop.DesktopController.move_mouse")
+    def test_orchestrator_move_mouse(self, mock_move):
+        from tools.desktop import DesktopActionResult
+        mock_move.return_value = DesktopActionResult(success=True, message="Moved mouse", action="move_mouse", verified=True)
         res = self.orchestrator.handle("Move mouse to 500, 400")
         self.assertEqual(res.plan.actions[0].tool, "move_mouse")
         self.assertEqual(res.plan.actions[0].arguments, {"x": 500, "y": 400})
         self.assertTrue(res.execution_result.results[0].success)
 
-    def test_orchestrator_click_mouse(self):
-        res = self.orchestrator.handle("Click mouse")
-        self.assertEqual(res.plan.actions[0].tool, "click_mouse")
-        self.assertTrue(res.execution_result.results[0].success)
-
-    def test_orchestrator_scroll_mouse(self):
+    @patch("tools.desktop.DesktopController.scroll_mouse")
+    def test_orchestrator_scroll_mouse(self, mock_scroll):
+        from tools.desktop import DesktopActionResult
+        mock_scroll.return_value = DesktopActionResult(success=True, message="Scrolled mouse", action="scroll_mouse", verified=True)
         res = self.orchestrator.handle("Scroll down")
         self.assertEqual(res.plan.actions[0].tool, "scroll_mouse")
         self.assertTrue(res.execution_result.results[0].success)
 
-    def test_orchestrator_type_text(self):
-        res = self.orchestrator.handle("Type Hello World")
-        self.assertEqual(res.plan.actions[0].tool, "type_text")
-        self.assertEqual(res.plan.actions[0].arguments["text"], "Hello World")
-        self.assertTrue(res.execution_result.results[0].success)
-
-    def test_orchestrator_press_key(self):
-        res = self.orchestrator.handle("Press Enter")
-        self.assertEqual(res.plan.actions[0].tool, "press_key")
-        self.assertEqual(res.plan.actions[0].arguments["key"], "enter")
-        self.assertTrue(res.execution_result.results[0].success)
-
-    def test_orchestrator_hotkey(self):
-        res = self.orchestrator.handle("Press Ctrl+A")
-        self.assertEqual(res.plan.actions[0].tool, "hotkey")
-        self.assertEqual(res.plan.actions[0].arguments["keys"], ["ctrl", "a"])
-        self.assertTrue(res.execution_result.results[0].success)
-
+    @patch("urllib.request.urlopen")
     @patch("webbrowser.open", return_value=True)
-    def test_orchestrator_browser_content_and_links(self, mock_open):
+    def test_orchestrator_browser_content_and_links(self, mock_open, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"<html><head><title>Google</title></head><body><h1>Google</h1><a href='https://google.com/about'>About</a></body></html>"
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_response
+
         self.orchestrator.handle("Open Google")
         res_content = self.orchestrator.handle("What content is visible?")
         self.assertEqual(res_content.plan.actions[0].tool, "browser_get_page_content")
@@ -199,10 +310,17 @@ class TestComputerControlPhase3(unittest.TestCase):
         self.assertEqual(res_links.plan.actions[0].tool, "browser_get_visible_links")
         self.assertTrue(res_links.execution_result.results[0].success)
 
-    def test_orchestrator_multi_step_computer_control(self):
+    @patch("PIL.ImageGrab.grab")
+    @patch("tools.desktop.DesktopController.move_mouse")
+    def test_orchestrator_multi_step_computer_control(self, mock_move, mock_grab):
+        from tools.desktop import DesktopActionResult
+        mock_grab.return_value = Image.new("RGB", (1920, 1080), color="black")
+        mock_move.return_value = DesktopActionResult(success=True, message="Moved mouse", action="move_mouse", verified=True)
+
         res = self.orchestrator.handle("Take a screenshot and then move mouse to 500, 300")
         self.assertEqual(len(res.plan.actions), 2)
         self.assertEqual(res.plan.actions[0].tool, "capture_screen")
         self.assertEqual(res.plan.actions[1].tool, "move_mouse")
         self.assertTrue(res.execution_result.results[0].success)
         self.assertTrue(res.execution_result.results[1].success)
+

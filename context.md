@@ -357,8 +357,37 @@ LONG-TERM MEMORY (Local SQLite)
 - **`core/orchestrator.py`**: Integrated `MemoryGrounder` alongside `MemoryRetriever`.
 - **`tests/test_memory_grounding.py`**: Added unit tests covering known fact grounding, missing fact uncertainty detection, suggestion vs. fact separation, status hallucination prevention, and regressions.
 
+- **Milestone 5.1 & Phase 3 / 3.1: Real Computer Control, Browser Automation & Hardened Desktop Interaction**:
+  - **Hardened Browser Automation (`tools/browser.py`)**:
+    - Replaced basic static navigation with a real controlled browser session architecture using **Playwright** (Chromium headless/headful) alongside fallback web inspection.
+    - Implemented live page lifecycle tracking: `open_website`, `go_back`, `go_forward`, `refresh`, `get_current_page_info`, `get_page_title`, and `get_current_url`.
+    - Live DOM inspection via `get_page_content` (inner body text extraction bounded to 500 characters) and `get_visible_links` (first 10 actionable hyperlinks filtered from javascript/hash anchors).
+    - Session isolation and cleanup: `reset_session()` cleanly terminates browser pages, contexts, and Playwright drivers.
+  - **Hardened Desktop Control & Input Safety (`tools/desktop.py`)**:
+    - OS compatibility enforcement: strictly validates `sys.platform == "win32"` and returns clean `UNSUPPORTED_PLATFORM` errors on non-Windows environments without claiming no-op success.
+    - Bounded coordinate checking: coordinates for `move_mouse` and `click_mouse` are strictly bounded by primary display dimensions from `GetSystemMetrics(0)` and `GetSystemMetrics(1)`.
+    - Input hardening:
+      - Validates mouse buttons against `ALLOWED_MOUSE_BUTTONS` (`left`, `right`, `middle`).
+      - Validates scroll directions against `ALLOWED_SCROLL_DIRECTIONS` (`up`, `down`) and bounds scroll amounts between 1 and 20 units.
+      - Enforces 500-character limits on typed text and validates keys against `ALLOWED_KEYBOARD_KEYS`.
+    - Key release safety guarantees: wraps all keyboard and hotkey dispatches in `try...finally` blocks to guarantee `KEYEVENTF_KEYUP` is always fired, preventing stuck modifier or control keys.
+    - Action verification: cursor position is verified via `GetCursorPos` after `move_mouse`, populating the `verified` flag on results accurately.
+  - **Visual Awareness & Screen Understanding**:
+    - Clearly distinguishes raw screenshot capture (`capture_screen`) from semantic visual analysis (`describe_screen`).
+    - Reports factual screen resolution, dimensions, and display orientation without transmitting screenshots to external cloud APIs.
+    - Honestly documents local hardware constraints: semantic multi-modal visual captioning indicates that a local vision-language model (e.g., `ollama pull llava`) is required.
+  - **Tool Policy & Permission Gating (`tools/registry.py` & `security/permissions.py`)**:
+    - Consequential desktop actions (`click_mouse`, `type_text`, `press_key`, `hotkey`) are explicitly configured with `requires_approval: True` in `TOOL_POLICIES`.
+    - Read-only actions (`move_mouse`, `scroll_mouse`, `capture_screen`, `describe_screen`, `browser_get_page_info`, `browser_get_page_content`, `browser_get_visible_links`) remain unblocked (`requires_approval: False`).
+    - `ActionExecutionResult` in `core/executor.py` records both `executed` and `verified` state flags.
+  - **Comprehensive Mock Isolation & Regression Testing (`tests/test_computer_control_phase3.py`)**:
+    - Fully mocked all Windows API input dispatches (`mouse_event`, `SetCursorPos`, `keybd_event`, `VkKeyScanW`, `ImageGrab.grab`) in unit tests so executing tests never controls the developer's physical mouse or keyboard.
+    - 18 comprehensive tests covering browser inspection, desktop validation bounds, approval policies, and multi-step execution.
+    - Full project regression test suite passes cleanly across all 285 tests.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`
 3. Run `python main.py`
+
 

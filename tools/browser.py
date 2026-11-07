@@ -1,3 +1,4 @@
+import os
 import re
 import urllib.parse
 import webbrowser
@@ -86,7 +87,8 @@ def validate_and_normalize_url(raw_target: str) -> tuple[str | None, str | None]
 class BrowserController:
     """
     Dedicated browser controller managing controlled browser session state.
-    Provides safe, non-shell browser navigation, history management, and factual page awareness.
+    Provides safe, non-shell browser navigation, genuine browser automation via Playwright
+    when available, session history management, and factual page awareness.
     Maintains active session awareness without fabricating state when no session is active.
     """
 
@@ -94,10 +96,37 @@ class BrowserController:
         self._active: bool = False
         self._history: list[dict[str, str]] = []
         self._history_index: int = -1
+        self._playwright = None
+        self._browser = None
+        self._page = None
 
     @property
     def is_active(self) -> bool:
         return self._active
+
+    def _ensure_browser(self) -> bool:
+        """
+        Lazily initialize controlled Playwright browser instance if available.
+        Returns True if Playwright page is available, False otherwise.
+        """
+        # Allow disabling Playwright browser launch during tests or non-interactive environments
+        if os.environ.get("DISABLE_PLAYWRIGHT_LAUNCH", "").lower() in {"1", "true", "yes"}:
+            return False
+
+        if self._page is not None and not self._page.is_closed():
+            return True
+
+        try:
+            from playwright.sync_api import sync_playwright
+            if self._playwright is None:
+                self._playwright = sync_playwright().start()
+            if self._browser is None or not self._browser.is_connected():
+                self._browser = self._playwright.chromium.launch(headless=True)
+            self._page = self._browser.new_page()
+            return True
+        except Exception:
+            # Playwright browser launch unavailable or restricted
+            return False
 
     def open_website(self, target: str) -> BrowserActionResult:
         """
@@ -113,7 +142,20 @@ class BrowserController:
             )
 
         title = self._derive_page_title(normalized_url)
-        entry = {"url": normalized_url, "title": title}
+        real_url = normalized_url
+
+        # Attempt navigation via real Playwright controlled browser
+        if self._ensure_browser():
+            try:
+                self._page.goto(normalized_url, wait_until="domcontentloaded", timeout=15000)
+                real_url = self._page.url or normalized_url
+                real_title = self._page.title()
+                if real_title:
+                    title = real_title
+            except Exception:
+                pass
+
+        entry = {"url": real_url, "title": title}
 
         # Truncate forward history if navigating from middle
         if self._history_index >= 0 and self._history_index < len(self._history) - 1:
@@ -123,24 +165,24 @@ class BrowserController:
         self._history_index = len(self._history) - 1
         self._active = True
 
-        # Open in real system browser without shell=True
+        # Open in real system browser without shell=True for user visibility
         try:
             webbrowser.open(normalized_url)
         except Exception as exc:
             return BrowserActionResult(
                 success=False,
                 message=f"Failed to open browser: {exc}",
-                url=normalized_url,
+                url=real_url,
                 title=title,
                 error=str(exc),
             )
 
         # Build clean message
-        site_name = self._derive_site_name(normalized_url)
+        site_name = self._derive_site_name(real_url)
         return BrowserActionResult(
             success=True,
             message=f"Opening {site_name}.",
-            url=normalized_url,
+            url=real_url,
             title=title,
         )
 
@@ -152,6 +194,28 @@ class BrowserController:
                 message="I don't currently have an active browser session to navigate.",
                 error="NO_ACTIVE_SESSION",
             )
+
+        # Attempt Playwright go_back if available
+        if self._page is not None and not self._page.is_closed():
+            try:
+                resp = self._page.go_back(wait_until="domcontentloaded", timeout=10000)
+                if resp:
+                    cur_url = self._page.url
+                    cur_title = self._page.title() or self._derive_page_title(cur_url)
+                    if self._history_index > 0:
+                        self._history_index -= 1
+                    try:
+                        webbrowser.open(cur_url)
+                    except Exception:
+                        pass
+                    return BrowserActionResult(
+                        success=True,
+                        message="Going back to the previous page.",
+                        url=cur_url,
+                        title=cur_title,
+                    )
+            except Exception:
+                pass
 
         if self._history_index <= 0:
             current = self._history[self._history_index]
@@ -185,6 +249,28 @@ class BrowserController:
                 message="I don't currently have an active browser session to navigate.",
                 error="NO_ACTIVE_SESSION",
             )
+
+        # Attempt Playwright go_forward if available
+        if self._page is not None and not self._page.is_closed():
+            try:
+                resp = self._page.go_forward(wait_until="domcontentloaded", timeout=10000)
+                if resp:
+                    cur_url = self._page.url
+                    cur_title = self._page.title() or self._derive_page_title(cur_url)
+                    if self._history_index < len(self._history) - 1:
+                        self._history_index += 1
+                    try:
+                        webbrowser.open(cur_url)
+                    except Exception:
+                        pass
+                    return BrowserActionResult(
+                        success=True,
+                        message="Going forward to the next page.",
+                        url=cur_url,
+                        title=cur_title,
+                    )
+            except Exception:
+                pass
 
         if self._history_index >= len(self._history) - 1:
             current = self._history[self._history_index]
@@ -220,6 +306,12 @@ class BrowserController:
             )
 
         current = self._history[self._history_index]
+        if self._page is not None and not self._page.is_closed():
+            try:
+                self._page.reload(wait_until="domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+
         try:
             webbrowser.open(current["url"])
         except Exception:
@@ -242,13 +334,27 @@ class BrowserController:
             )
 
         current = self._history[self._history_index]
-        site_name = self._derive_site_name(current["url"])
-        msg = f"You are currently on {site_name}.\nURL: {current['url']}"
+        url = current["url"]
+        title = current["title"]
+
+        if self._page is not None and not self._page.is_closed():
+            try:
+                page_url = self._page.url
+                page_title = self._page.title()
+                if page_url:
+                    url = page_url
+                if page_title:
+                    title = page_title
+            except Exception:
+                pass
+
+        site_name = self._derive_site_name(url)
+        msg = f"You are currently on {site_name}.\nURL: {url}"
         return BrowserActionResult(
             success=True,
             message=msg,
-            url=current["url"],
-            title=current["title"],
+            url=url,
+            title=title,
         )
 
     def get_page_title(self) -> BrowserActionResult:
@@ -261,11 +367,22 @@ class BrowserController:
             )
 
         current = self._history[self._history_index]
+        title = current["title"]
+        url = current["url"]
+
+        if self._page is not None and not self._page.is_closed():
+            try:
+                page_title = self._page.title()
+                if page_title:
+                    title = page_title
+            except Exception:
+                pass
+
         return BrowserActionResult(
             success=True,
-            message=f"The current page is:\n{current['title']}",
-            url=current["url"],
-            title=current["title"],
+            message=f"The current page is:\n{title}",
+            url=url,
+            title=title,
         )
 
     def get_current_url(self) -> BrowserActionResult:
@@ -278,17 +395,28 @@ class BrowserController:
             )
 
         current = self._history[self._history_index]
+        url = current["url"]
+        title = current["title"]
+
+        if self._page is not None and not self._page.is_closed():
+            try:
+                page_url = self._page.url
+                if page_url:
+                    url = page_url
+            except Exception:
+                pass
+
         return BrowserActionResult(
             success=True,
-            message=f"You are currently at:\n{current['url']}",
-            url=current["url"],
-            title=current["title"],
+            message=f"You are currently at:\n{url}",
+            url=url,
+            title=title,
         )
 
     def get_page_content(self) -> BrowserActionResult:
         """
         Inspect actual page content of the current page.
-        Uses local HTML parser and safe fetcher to extract visible text and headings.
+        Uses live Playwright page DOM when active, falling back to safe local HTML parsing.
         Treated strictly as untrusted text.
         """
         if not self._active or self._history_index < 0 or not self._history:
@@ -300,8 +428,27 @@ class BrowserController:
 
         current = self._history[self._history_index]
         target_url = current["url"]
+        title = current["title"]
 
-        # Attempt safe inspection of actual webpage content via BeautifulSoup
+        # 1. Use Playwright live session if available
+        if self._page is not None and not self._page.is_closed():
+            try:
+                # Extract inner text from body
+                body_text = self._page.inner_text("body", timeout=5000)
+                clean_text = " ".join(body_text.split())
+                p_title = self._page.title() or title
+                preview = clean_text[:500] + ("..." if len(clean_text) > 500 else "")
+                return BrowserActionResult(
+                    success=True,
+                    message=f"Page content for {p_title}:\n{preview}",
+                    url=self._page.url or target_url,
+                    title=p_title,
+                    data={"content": preview, "full_length": len(clean_text)},
+                )
+            except Exception:
+                pass
+
+        # 2. Attempt safe inspection of actual webpage content via BeautifulSoup
         try:
             import urllib.request
             import bs4
@@ -317,14 +464,14 @@ class BrowserController:
                 for script in soup(["script", "style", "noscript"]):
                     script.extract()
                 text = " ".join(soup.get_text().split())
-                title = soup.title.string.strip() if soup.title and soup.title.string else current["title"]
-                current["title"] = title
+                parsed_title = soup.title.string.strip() if soup.title and soup.title.string else title
+                current["title"] = parsed_title
                 preview = text[:500] + ("..." if len(text) > 500 else "")
                 return BrowserActionResult(
                     success=True,
-                    message=f"Page content for {current['title']}:\n{preview}",
+                    message=f"Page content for {parsed_title}:\n{preview}",
                     url=target_url,
-                    title=title,
+                    title=parsed_title,
                     data={"content": preview, "full_length": len(text)},
                 )
         except Exception:
@@ -342,6 +489,7 @@ class BrowserController:
     def get_visible_links(self) -> BrowserActionResult:
         """
         Extract visible links from the currently controlled webpage.
+        Uses live Playwright page DOM when active, falling back to safe local HTML parsing.
         Strictly limits output to first 10 links to maintain bounded resources.
         """
         if not self._active or self._history_index < 0 or not self._history:
@@ -354,6 +502,34 @@ class BrowserController:
         current = self._history[self._history_index]
         target_url = current["url"]
 
+        # 1. Use Playwright live session if available
+        if self._page is not None and not self._page.is_closed():
+            try:
+                # Query visible anchors from live DOM
+                raw_links = self._page.eval_on_selector_all(
+                    "a[href]",
+                    """elements => elements.map(e => ({
+                        text: e.innerText.trim(),
+                        href: e.href
+                    })).filter(item => item.text && !item.href.startsWith('javascript:') && !item.href.startsWith('#')).slice(0, 10)"""
+                )
+                if raw_links:
+                    links = [(item["text"], item["href"]) for item in raw_links]
+                    lines = [f"Found {len(links)} visible links on {current['title']}:"]
+                    for idx, (t, u) in enumerate(links, 1):
+                        lines.append(f"{idx}. {t} -> {u}")
+                    msg = "\n".join(lines)
+                    return BrowserActionResult(
+                        success=True,
+                        message=msg,
+                        url=self._page.url or target_url,
+                        title=current["title"],
+                        data={"links": links},
+                    )
+            except Exception:
+                pass
+
+        # 2. BeautifulSoup fallback
         try:
             import urllib.request
             import bs4
@@ -401,10 +577,28 @@ class BrowserController:
         )
 
     def reset_session(self) -> None:
-        """Reset the controlled browser session state."""
+        """Reset the controlled browser session state and close Playwright browser page."""
         self._active = False
         self._history.clear()
         self._history_index = -1
+        if self._page is not None:
+            try:
+                self._page.close()
+            except Exception:
+                pass
+            self._page = None
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
 
     def reset(self) -> None:
         """Alias for reset_session to support test teardown and cleanup."""

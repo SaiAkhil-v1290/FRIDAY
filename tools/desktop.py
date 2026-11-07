@@ -63,12 +63,17 @@ ALLOWED_KEYBOARD_KEYS = {
     "f12": 0x7B,
 }
 
+# Supported mouse buttons
+ALLOWED_MOUSE_BUTTONS = {"left", "right", "middle"}
+
+# Supported mouse scroll directions
+ALLOWED_SCROLL_DIRECTIONS = {"up", "down"}
+
 # Mouse event constants (Windows API)
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
-MOUSEEVENTF_RIGHTUP = 0x0004  # 0x0010
 MOUSEEVENTF_RIGHTUP_REAL = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
@@ -83,11 +88,14 @@ class DesktopController:
     """
     Dedicated controller for desktop screen capture, mouse, and keyboard interaction.
     Operates safely with:
-    - Strict boundary checking for all coordinates
-    - Rate-limiting / timeout protection
+    - OS compatibility checks (explicitly rejecting non-Windows environments)
+    - Strict boundary checking for all coordinates against GetSystemMetrics
+    - Hardened button and direction validation
+    - Try/finally key release safety guarantees
     - Input length limits (max 500 characters)
     - Zero shell execution (ctypes and win32 APIs directly)
     - Local screenshot capture and private storage without cloud transmission
+    - Honest visual awareness reporting distinguishing capture from semantic analysis
     """
 
     def __init__(self, screenshot_dir: Path | None = None) -> None:
@@ -95,9 +103,21 @@ class DesktopController:
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._last_screenshot_path: Path | None = None
 
+    def _check_os_support(self, action_name: str) -> DesktopActionResult | None:
+        """Check if operating system supports desktop interaction APIs."""
+        if sys.platform != "win32":
+            return DesktopActionResult(
+                success=False,
+                message=f"Action '{action_name}' is not supported on platform '{sys.platform}'. Windows is required.",
+                action=action_name,
+                error="UNSUPPORTED_PLATFORM",
+                verified=False,
+            )
+        return None
+
     def get_screen_dimensions(self) -> tuple[int, int]:
         """Return (width, height) in pixels of primary display."""
-        if os.name == "nt":
+        if sys.platform == "win32":
             user32 = ctypes.windll.user32
             width = user32.GetSystemMetrics(0)
             height = user32.GetSystemMetrics(1)
@@ -138,30 +158,40 @@ class DesktopController:
                 message=f"Failed to capture screen: {exc}",
                 action="capture_screen",
                 error=str(exc),
+                verified=False,
             )
 
     def describe_screen(self) -> DesktopActionResult:
         """
-        Capture and analyze screen layout locally (dimensions, active windows, orientation).
+        Capture and analyze screen layout locally (dimensions, display resolution, orientation).
+        Clearly documents hardware limitations: semantic VLM reasoning requires a local vision model.
         Strictly local analysis without external cloud transmission.
         """
         cap = self.capture_screen(save=True)
         if not cap.success:
             return cap
 
-        w, h = cap.data["width"], cap.data["height"]
-        msg = f"Screen captured successfully: {w}x{h} resolution.\nDisplay is active in landscape orientation."
+        w = cap.data["width"]
+        h = cap.data["height"]
+        orientation = "landscape" if w >= h else "portrait"
+        
+        # Local structural description without fabricating ungrounded OCR
+        msg = (
+            f"Screen captured successfully: {w}x{h} resolution ({orientation} orientation).\n"
+            f"Image saved locally to storage.\n"
+            f"Semantic visual captioning requires a local vision-language model."
+        )
         return DesktopActionResult(
             success=True,
             message=msg,
             action="describe_screen",
-            data=cap.data,
+            data={**cap.data, "orientation": orientation, "semantic_model": "local_vlm_required"},
             verified=True,
         )
 
     def get_mouse_position(self) -> tuple[int, int]:
         """Get current mouse cursor position (x, y)."""
-        if os.name == "nt":
+        if sys.platform == "win32":
             pt = ctypes.wintypes.POINT()
             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
             return int(pt.x), int(pt.y)
@@ -171,27 +201,51 @@ class DesktopController:
         """
         Move the mouse cursor to (x, y).
         Strictly validates that (x, y) are within screen bounds.
+        Verifies resulting cursor position.
         """
-        max_w, max_h = self.get_screen_dimensions()
-        if not (0 <= x <= max_w and 0 <= y <= max_h):
+        os_err = self._check_os_support("move_mouse")
+        if os_err:
+            return os_err
+
+        try:
+            x_int = int(x)
+            y_int = int(y)
+        except (ValueError, TypeError):
             return DesktopActionResult(
                 success=False,
-                message=f"Coordinates ({x}, {y}) are outside the screen bounds (0-{max_w}, 0-{max_h}).",
+                message=f"Invalid mouse coordinates: ({x}, {y}). Coordinates must be integers.",
                 action="move_mouse",
                 target=f"({x}, {y})",
+                error="INVALID_COORDINATES",
+                verified=False,
+            )
+
+        max_w, max_h = self.get_screen_dimensions()
+        if not (0 <= x_int <= max_w and 0 <= y_int <= max_h):
+            return DesktopActionResult(
+                success=False,
+                message=f"Coordinates ({x_int}, {y_int}) are outside the screen bounds (0-{max_w}, 0-{max_h}).",
+                action="move_mouse",
+                target=f"({x_int}, {y_int})",
                 error="OUT_OF_BOUNDS",
+                verified=False,
             )
 
         try:
-            if os.name == "nt":
-                ctypes.windll.user32.SetCursorPos(int(x), int(y))
+            user32 = ctypes.windll.user32
+            res = user32.SetCursorPos(x_int, y_int)
+            # Verify cursor position
+            actual_x, actual_y = self.get_mouse_position()
+            # In headless or non-interactive sessions SetCursorPos may return 0 or position might not update
+            verified = bool(res != 0) and (abs(actual_x - x_int) <= 10 and abs(actual_y - y_int) <= 10)
+            
             return DesktopActionResult(
                 success=True,
-                message=f"Moved mouse cursor to ({x}, {y}).",
+                message=f"Moved mouse cursor to ({x_int}, {y_int}).",
                 action="move_mouse",
-                target=f"({x}, {y})",
-                data={"x": x, "y": y},
-                verified=True,
+                target=f"({x_int}, {y_int})",
+                data={"x": x_int, "y": y_int, "verified_position": (actual_x, actual_y)},
+                verified=verified,
             )
         except Exception as exc:
             return DesktopActionResult(
@@ -199,6 +253,7 @@ class DesktopController:
                 message=f"Failed to move mouse: {exc}",
                 action="move_mouse",
                 error=str(exc),
+                verified=False,
             )
 
     def click_mouse(
@@ -210,8 +265,23 @@ class DesktopController:
     ) -> DesktopActionResult:
         """
         Click the mouse at (x, y) or current position.
-        Validates bounds and dispatches OS mouse event.
+        Validates button type ('left', 'right', 'middle') and bounds.
         """
+        os_err = self._check_os_support("click_mouse")
+        if os_err:
+            return os_err
+
+        btn = button.strip().lower() if button else "left"
+        if btn not in ALLOWED_MOUSE_BUTTONS:
+            return DesktopActionResult(
+                success=False,
+                message=f"Invalid mouse button: '{button}'. Allowed buttons: {', '.join(sorted(ALLOWED_MOUSE_BUTTONS))}.",
+                action="click_mouse",
+                target=str(button),
+                error="INVALID_BUTTON",
+                verified=False,
+            )
+
         if x is not None and y is not None:
             move_res = self.move_mouse(x, y)
             if not move_res.success:
@@ -221,30 +291,32 @@ class DesktopController:
             cur_x, cur_y = self.get_mouse_position()
 
         try:
-            if os.name == "nt":
-                user32 = ctypes.windll.user32
-                if button.lower() == "right":
-                    down_ev = MOUSEEVENTF_RIGHTDOWN
-                    up_ev = MOUSEEVENTF_RIGHTUP_REAL
-                else:
-                    down_ev = MOUSEEVENTF_LEFTDOWN
-                    up_ev = MOUSEEVENTF_LEFTUP
+            user32 = ctypes.windll.user32
+            if btn == "right":
+                down_ev = MOUSEEVENTF_RIGHTDOWN
+                up_ev = MOUSEEVENTF_RIGHTUP_REAL
+            elif btn == "middle":
+                down_ev = MOUSEEVENTF_MIDDLEDOWN
+                up_ev = MOUSEEVENTF_MIDDLEUP
+            else:
+                down_ev = MOUSEEVENTF_LEFTDOWN
+                up_ev = MOUSEEVENTF_LEFTUP
 
-                clicks = 2 if double else 1
-                for _ in range(clicks):
-                    user32.mouse_event(down_ev, 0, 0, 0, 0)
+            clicks = 2 if double else 1
+            for _ in range(clicks):
+                user32.mouse_event(down_ev, 0, 0, 0, 0)
+                time.sleep(0.05)
+                user32.mouse_event(up_ev, 0, 0, 0, 0)
+                if double:
                     time.sleep(0.05)
-                    user32.mouse_event(up_ev, 0, 0, 0, 0)
-                    if double:
-                        time.sleep(0.05)
 
             action_desc = "double clicked" if double else "clicked"
             return DesktopActionResult(
                 success=True,
-                message=f"Successfully {action_desc} {button} mouse button at ({cur_x}, {cur_y}).",
+                message=f"Successfully {action_desc} {btn} mouse button at ({cur_x}, {cur_y}).",
                 action="click_mouse",
                 target=f"({cur_x}, {cur_y})",
-                data={"x": cur_x, "y": cur_y, "button": button, "double": double},
+                data={"x": cur_x, "y": cur_y, "button": btn, "double": double},
                 verified=True,
             )
         except Exception as exc:
@@ -253,23 +325,58 @@ class DesktopController:
                 message=f"Failed to click mouse: {exc}",
                 action="click_mouse",
                 error=str(exc),
+                verified=False,
             )
 
     def scroll_mouse(self, direction: str = "down", amount: int = 3) -> DesktopActionResult:
         """
         Scroll mouse wheel up or down by amount clicks.
+        Validates direction in {'up', 'down'} and bounds amount between 1 and 20.
         """
-        delta = -120 * amount if direction.lower() == "down" else 120 * amount
+        os_err = self._check_os_support("scroll_mouse")
+        if os_err:
+            return os_err
+
+        dir_clean = direction.strip().lower() if direction else "down"
+        if dir_clean not in ALLOWED_SCROLL_DIRECTIONS:
+            return DesktopActionResult(
+                success=False,
+                message=f"Invalid scroll direction: '{direction}'. Allowed directions: {', '.join(sorted(ALLOWED_SCROLL_DIRECTIONS))}.",
+                action="scroll_mouse",
+                error="INVALID_DIRECTION",
+                verified=False,
+            )
+
         try:
-            if os.name == "nt":
-                user32 = ctypes.windll.user32
-                user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+            amt = int(amount)
+        except (ValueError, TypeError):
+            return DesktopActionResult(
+                success=False,
+                message=f"Invalid scroll amount: '{amount}'. Must be an integer between 1 and 20.",
+                action="scroll_mouse",
+                error="INVALID_AMOUNT",
+                verified=False,
+            )
+
+        if not (1 <= amt <= 20):
+            return DesktopActionResult(
+                success=False,
+                message=f"Scroll amount {amt} is out of bounds (allowed range: 1 to 20).",
+                action="scroll_mouse",
+                error="OUT_OF_BOUNDS",
+                verified=False,
+            )
+
+        delta = -120 * amt if dir_clean == "down" else 120 * amt
+        try:
+            user32 = ctypes.windll.user32
+            user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
 
             return DesktopActionResult(
                 success=True,
-                message=f"Scrolled mouse wheel {direction} by {amount} units.",
+                message=f"Scrolled mouse wheel {dir_clean} by {amt} units.",
                 action="scroll_mouse",
-                data={"direction": direction, "amount": amount},
+                data={"direction": dir_clean, "amount": amt},
                 verified=True,
             )
         except Exception as exc:
@@ -278,20 +385,26 @@ class DesktopController:
                 message=f"Failed to scroll mouse: {exc}",
                 action="scroll_mouse",
                 error=str(exc),
+                verified=False,
             )
 
     def type_text(self, text: str) -> DesktopActionResult:
         """
         Type text safely using Windows SendInput / keybd_event.
         Enforces maximum text length (500 chars).
-        Rejects command executions and shell execution attempts.
+        Uses try/finally to guarantee modifier keys (Shift) are always released.
         """
+        os_err = self._check_os_support("type_text")
+        if os_err:
+            return os_err
+
         if not text:
             return DesktopActionResult(
                 success=False,
                 message="Cannot type empty text.",
                 action="type_text",
                 error="EMPTY_TEXT",
+                verified=False,
             )
 
         if len(text) > 500:
@@ -300,27 +413,26 @@ class DesktopController:
                 message=f"Input text exceeds maximum allowed limit of 500 characters (provided {len(text)}).",
                 action="type_text",
                 error="TEXT_TOO_LONG",
+                verified=False,
             )
 
         try:
-            if os.name == "nt":
-                user32 = ctypes.windll.user32
-                for ch in text:
-                    # Use VkKeyScan to find virtual key code
-                    vk_code = user32.VkKeyScanW(ord(ch))
-                    vk = vk_code & 0xFF
-                    shift = (vk_code >> 8) & 1
+            user32 = ctypes.windll.user32
+            for ch in text:
+                vk_code = user32.VkKeyScanW(ord(ch))
+                vk = vk_code & 0xFF
+                shift = (vk_code >> 8) & 1
 
-                    if shift:
-                        user32.keybd_event(0x10, 0, 0, 0)  # Shift down
-
+                if shift:
+                    user32.keybd_event(0x10, 0, 0, 0)  # Shift down
+                try:
                     user32.keybd_event(vk, 0, 0, 0)
                     time.sleep(0.01)
                     user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-
+                finally:
                     if shift:
                         user32.keybd_event(0x10, 0, KEYEVENTF_KEYUP, 0)  # Shift up
-                    time.sleep(0.01)
+                time.sleep(0.01)
 
             return DesktopActionResult(
                 success=True,
@@ -336,14 +448,20 @@ class DesktopController:
                 message=f"Failed to type text: {exc}",
                 action="type_text",
                 error=str(exc),
+                verified=False,
             )
 
     def press_key(self, key_name: str) -> DesktopActionResult:
         """
         Press a single keyboard key (e.g. Enter, Esc, Tab, Space, Backspace).
-        Validates against ALLOWED_KEYBOARD_KEYS to prevent arbitrary control sequences.
+        Validates against ALLOWED_KEYBOARD_KEYS.
+        Guarantees key release with try/finally.
         """
-        key_clean = key_name.strip().lower()
+        os_err = self._check_os_support("press_key")
+        if os_err:
+            return os_err
+
+        key_clean = key_name.strip().lower() if key_name else ""
         if key_clean not in ALLOWED_KEYBOARD_KEYS:
             return DesktopActionResult(
                 success=False,
@@ -351,14 +469,16 @@ class DesktopController:
                 action="press_key",
                 target=key_name,
                 error="UNSUPPORTED_KEY",
+                verified=False,
             )
 
         vk = ALLOWED_KEYBOARD_KEYS[key_clean]
         try:
-            if os.name == "nt":
-                user32 = ctypes.windll.user32
-                user32.keybd_event(vk, 0, 0, 0)
+            user32 = ctypes.windll.user32
+            user32.keybd_event(vk, 0, 0, 0)
+            try:
                 time.sleep(0.05)
+            finally:
                 user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
 
             return DesktopActionResult(
@@ -374,19 +494,26 @@ class DesktopController:
                 message=f"Failed to press key '{key_name}': {exc}",
                 action="press_key",
                 error=str(exc),
+                verified=False,
             )
 
     def hotkey(self, *keys: str) -> DesktopActionResult:
         """
         Press a hotkey combination (e.g. ctrl, a).
         Validates all keys against ALLOWED_KEYBOARD_KEYS.
+        Guarantees all pressed keys are released in reverse order in try/finally.
         """
+        os_err = self._check_os_support("hotkey")
+        if os_err:
+            return os_err
+
         if not keys:
             return DesktopActionResult(
                 success=False,
                 message="No keys provided for hotkey combination.",
                 action="hotkey",
                 error="EMPTY_KEYS",
+                verified=False,
             )
 
         vk_list = []
@@ -395,9 +522,8 @@ class DesktopController:
             if k_clean in ALLOWED_KEYBOARD_KEYS:
                 vk_list.append(ALLOWED_KEYBOARD_KEYS[k_clean])
             elif len(k_clean) == 1 and k_clean.isalnum():
-                if os.name == "nt":
-                    vk_code = ctypes.windll.user32.VkKeyScanW(ord(k_clean)) & 0xFF
-                    vk_list.append(vk_code)
+                vk_code = ctypes.windll.user32.VkKeyScanW(ord(k_clean)) & 0xFF
+                vk_list.append(vk_code)
             else:
                 return DesktopActionResult(
                     success=False,
@@ -405,34 +531,32 @@ class DesktopController:
                     action="hotkey",
                     target="+".join(keys),
                     error="UNSUPPORTED_KEY",
+                    verified=False,
                 )
 
+        pressed_keys = []
         try:
-            if os.name == "nt":
-                user32 = ctypes.windll.user32
-                # Press down in order
-                for vk in vk_list:
-                    user32.keybd_event(vk, 0, 0, 0)
+            user32 = ctypes.windll.user32
+            for vk in vk_list:
+                user32.keybd_event(vk, 0, 0, 0)
+                pressed_keys.append(vk)
+                time.sleep(0.02)
+        finally:
+            # Release all pressed keys in reverse order even on error
+            for vk in reversed(pressed_keys):
+                try:
+                    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
                     time.sleep(0.02)
-                # Release in reverse order
-                for vk in reversed(vk_list):
-                    user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-                    time.sleep(0.02)
+                except Exception:
+                    pass
 
-            return DesktopActionResult(
-                success=True,
-                message=f"Pressed hotkey: {'+'.join(keys)}.",
-                action="hotkey",
-                target="+".join(keys),
-                verified=True,
-            )
-        except Exception as exc:
-            return DesktopActionResult(
-                success=False,
-                message=f"Failed to press hotkey: {exc}",
-                action="hotkey",
-                error=str(exc),
-            )
+        return DesktopActionResult(
+            success=True,
+            message=f"Pressed hotkey: {'+'.join(keys)}.",
+            action="hotkey",
+            target="+".join(keys),
+            verified=True,
+        )
 
 
 # Singleton instance
@@ -445,3 +569,4 @@ def get_desktop_controller() -> DesktopController:
     if _desktop_controller_instance is None:
         _desktop_controller_instance = DesktopController()
     return _desktop_controller_instance
+

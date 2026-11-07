@@ -57,6 +57,7 @@ class ActionExecutionResult:
     message: str
     error: str | None = None
     requires_approval: bool = False
+    verified: bool = False
 
 
 @dataclass
@@ -355,6 +356,7 @@ class PlanExecutor:
                     success=d_res.success,
                     message=d_res.message,
                     error=d_res.error,
+                    verified=d_res.verified,
                 )
 
             elif tool_name == "describe_screen":
@@ -367,6 +369,7 @@ class PlanExecutor:
                     success=d_res.success,
                     message=d_res.message,
                     error=d_res.error,
+                    verified=d_res.verified,
                 )
 
             elif tool_name == "move_mouse":
@@ -402,6 +405,7 @@ class PlanExecutor:
                     success=d_res.success,
                     message=d_res.message,
                     error=d_res.error,
+                    verified=d_res.verified,
                 )
 
             elif tool_name == "click_mouse":
@@ -420,6 +424,7 @@ class PlanExecutor:
                     success=d_res.success,
                     message=d_res.message,
                     error=d_res.error,
+                    verified=d_res.verified,
                 )
 
             elif tool_name == "scroll_mouse":
@@ -434,6 +439,7 @@ class PlanExecutor:
                     success=d_res.success,
                     message=d_res.message,
                     error=d_res.error,
+                    verified=d_res.verified,
                 )
 
             elif tool_name == "type_text":
@@ -447,6 +453,7 @@ class PlanExecutor:
                     success=d_res.success,
                     message=d_res.message,
                     error=d_res.error,
+                    verified=d_res.verified,
                 )
 
             elif tool_name == "press_key":
@@ -460,6 +467,7 @@ class PlanExecutor:
                     success=d_res.success,
                     message=d_res.message,
                     error=d_res.error,
+                    verified=d_res.verified,
                 )
 
             elif tool_name == "hotkey":
@@ -475,6 +483,7 @@ class PlanExecutor:
                     success=d_res.success,
                     message=d_res.message,
                     error=d_res.error,
+                    verified=d_res.verified,
                 )
 
             elif tool_name == "find_files":

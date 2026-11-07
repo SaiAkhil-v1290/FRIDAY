@@ -35,6 +35,16 @@ class BrowserActionResult:
     error: str | None = None
 
 
+def _normalize_browser_url(url: str | None) -> str | None:
+    """Normalize trailing slash on bare domains so URL comparison is consistent."""
+    if not url:
+        return url
+    if url.endswith("/") and url.count("/") == 3 and not url.startswith("data:"):
+        # e.g. https://example.com/ -> https://example.com
+        return url[:-1]
+    return url
+
+
 def validate_and_normalize_url(raw_target: str) -> tuple[str | None, str | None]:
     """
     Validate and normalize a URL or safe website alias.
@@ -69,11 +79,14 @@ def validate_and_normalize_url(raw_target: str) -> tuple[str | None, str | None]
     if target_lower in SAFE_WEBSITE_ALIASES:
         return SAFE_WEBSITE_ALIASES[target_lower], None
 
-    # 2. Check explicit schemes (http://, https://)
+    # 2. Check explicit schemes (http://, https://, or data: for testing)
     if target.startswith(("http://", "https://")):
         parsed = urllib.parse.urlparse(target)
-        if not parsed.netloc or "." not in parsed.netloc:
+        if not parsed.netloc or ("." not in parsed.netloc and parsed.netloc.split(":")[0] not in {"localhost", "127.0.0.1"}):
             return None, f"Invalid URL domain: '{raw_target}'"
+        return target, None
+
+    if target.startswith("data:text/html"):
         return target, None
 
     # 3. Check domain-like strings (e.g. example.com, www.example.com, github.com)
@@ -86,35 +99,30 @@ def validate_and_normalize_url(raw_target: str) -> tuple[str | None, str | None]
 
 class BrowserController:
     """
-    Dedicated browser controller managing controlled browser session state.
+    Dedicated browser controller managing a genuinely controlled Playwright Chromium session.
     Provides safe, non-shell browser navigation, genuine browser automation via Playwright
-    when available, session history management, and factual page awareness.
-    Maintains active session awareness without fabricating state when no session is active.
+    as the single source of truth, live page lifecycle tracking, and verified page awareness.
+    Never uses fake fallbacks (no urllib, no BeautifulSoup, no webbrowser.open, no simulated history).
     """
 
     def __init__(self) -> None:
         self._active: bool = False
-        self._history: list[dict[str, str]] = []
-        self._history_index: int = -1
         self._playwright = None
         self._browser = None
         self._page = None
 
     @property
     def is_active(self) -> bool:
-        return self._active
+        return self._active and self._page is not None and not self._page.is_closed()
 
-    def _ensure_browser(self) -> bool:
+    def _ensure_browser(self) -> tuple[bool, str | None]:
         """
-        Lazily initialize controlled Playwright browser instance if available.
-        Returns True if Playwright page is available, False otherwise.
+        Lazily initialize controlled Playwright browser instance.
+        Returns (success, error_message).
+        Playwright is the single source of truth; if unavailable, returns explicit failure.
         """
-        # Allow disabling Playwright browser launch during tests or non-interactive environments
-        if os.environ.get("DISABLE_PLAYWRIGHT_LAUNCH", "").lower() in {"1", "true", "yes"}:
-            return False
-
         if self._page is not None and not self._page.is_closed():
-            return True
+            return True, None
 
         try:
             from playwright.sync_api import sync_playwright
@@ -123,15 +131,17 @@ class BrowserController:
             if self._browser is None or not self._browser.is_connected():
                 self._browser = self._playwright.chromium.launch(headless=True)
             self._page = self._browser.new_page()
-            return True
-        except Exception:
-            # Playwright browser launch unavailable or restricted
-            return False
+            self._active = True
+            return True, None
+        except ImportError:
+            return False, "Playwright is not installed. Please run: pip install playwright && python -m playwright install chromium"
+        except Exception as exc:
+            return False, f"Failed to launch controlled Playwright Chromium browser: {exc}"
 
     def open_website(self, target: str) -> BrowserActionResult:
         """
-        Navigate to a website alias or validated URL.
-        Reuses or starts the controlled session, updates history, and dispatches to system browser.
+        Navigate to a website alias or validated URL using the controlled Playwright session.
+        Never dispatches to system browser or simulates state.
         """
         normalized_url, err = validate_and_normalize_url(target)
         if err or not normalized_url:
@@ -141,446 +151,294 @@ class BrowserController:
                 error="INVALID_URL",
             )
 
-        title = self._derive_page_title(normalized_url)
-        real_url = normalized_url
+        ready, launch_err = self._ensure_browser()
+        if not ready or self._page is None:
+            return BrowserActionResult(
+                success=False,
+                message=launch_err or "Playwright browser is unavailable.",
+                error="BROWSER_UNAVAILABLE",
+            )
 
-        # Attempt navigation via real Playwright controlled browser
-        if self._ensure_browser():
-            try:
-                self._page.goto(normalized_url, wait_until="domcontentloaded", timeout=15000)
-                real_url = self._page.url or normalized_url
-                real_title = self._page.title()
-                if real_title:
-                    title = real_title
-            except Exception:
-                pass
-
-        entry = {"url": real_url, "title": title}
-
-        # Truncate forward history if navigating from middle
-        if self._history_index >= 0 and self._history_index < len(self._history) - 1:
-            self._history = self._history[: self._history_index + 1]
-
-        self._history.append(entry)
-        self._history_index = len(self._history) - 1
-        self._active = True
-
-        # Open in real system browser without shell=True for user visibility
         try:
-            webbrowser.open(normalized_url)
+            response = self._page.goto(normalized_url, wait_until="domcontentloaded", timeout=15000)
+            real_url = _normalize_browser_url(self._page.url) or normalized_url
+            real_title = self._page.title() or self._derive_page_title(real_url)
+            self._active = True
+
+            site_name = self._derive_site_name(real_url)
+            return BrowserActionResult(
+                success=True,
+                message=f"Opening {site_name}.",
+                url=real_url,
+                title=real_title,
+            )
         except Exception as exc:
             return BrowserActionResult(
                 success=False,
-                message=f"Failed to open browser: {exc}",
-                url=real_url,
-                title=title,
+                message=f"Failed to navigate to {normalized_url}: {exc}",
+                url=normalized_url,
                 error=str(exc),
             )
 
-        # Build clean message
-        site_name = self._derive_site_name(real_url)
-        return BrowserActionResult(
-            success=True,
-            message=f"Opening {site_name}.",
-            url=real_url,
-            title=title,
-        )
-
     def go_back(self) -> BrowserActionResult:
-        """Navigate back to the previous page in controlled browser session history."""
-        if not self._active or not self._history:
+        """Navigate back to the previous page in the actual controlled Playwright browser session."""
+        if not self.is_active:
             return BrowserActionResult(
                 success=False,
                 message="I don't currently have an active browser session to navigate.",
                 error="NO_ACTIVE_SESSION",
             )
 
-        # Attempt Playwright go_back if available
-        if self._page is not None and not self._page.is_closed():
-            try:
-                resp = self._page.go_back(wait_until="domcontentloaded", timeout=10000)
-                if resp:
-                    cur_url = self._page.url
-                    cur_title = self._page.title() or self._derive_page_title(cur_url)
-                    if self._history_index > 0:
-                        self._history_index -= 1
-                    try:
-                        webbrowser.open(cur_url)
-                    except Exception:
-                        pass
-                    return BrowserActionResult(
-                        success=True,
-                        message="Going back to the previous page.",
-                        url=cur_url,
-                        title=cur_title,
-                    )
-            except Exception:
-                pass
+        try:
+            prev_url = _normalize_browser_url(self._page.url)
+            resp = self._page.go_back(wait_until="domcontentloaded", timeout=10000)
+            cur_url = _normalize_browser_url(self._page.url)
+            cur_title = self._page.title() or self._derive_page_title(cur_url)
 
-        if self._history_index <= 0:
-            current = self._history[self._history_index]
+            # If response is None and the URL didn't change, we are at beginning of history
+            if resp is None and cur_url == prev_url:
+                return BrowserActionResult(
+                    success=False,
+                    message="You are already at the beginning of browser navigation history.",
+                    url=cur_url,
+                    title=cur_title,
+                    error="NO_PREVIOUS_PAGE",
+                )
+
+            return BrowserActionResult(
+                success=True,
+                message="Going back to the previous page.",
+                url=cur_url,
+                title=cur_title,
+            )
+        except Exception as exc:
             return BrowserActionResult(
                 success=False,
-                message="You are already at the beginning of browser navigation history.",
-                url=current["url"],
-                title=current["title"],
-                error="NO_PREVIOUS_PAGE",
+                message=f"Failed to navigate back: {exc}",
+                error=str(exc),
             )
-
-        self._history_index -= 1
-        prev = self._history[self._history_index]
-        try:
-            webbrowser.open(prev["url"])
-        except Exception:
-            pass
-
-        return BrowserActionResult(
-            success=True,
-            message="Going back to the previous page.",
-            url=prev["url"],
-            title=prev["title"],
-        )
 
     def go_forward(self) -> BrowserActionResult:
-        """Navigate forward to the next page in controlled browser session history."""
-        if not self._active or not self._history:
+        """Navigate forward to the next page in the actual controlled Playwright browser session."""
+        if not self.is_active:
             return BrowserActionResult(
                 success=False,
                 message="I don't currently have an active browser session to navigate.",
                 error="NO_ACTIVE_SESSION",
             )
 
-        # Attempt Playwright go_forward if available
-        if self._page is not None and not self._page.is_closed():
-            try:
-                resp = self._page.go_forward(wait_until="domcontentloaded", timeout=10000)
-                if resp:
-                    cur_url = self._page.url
-                    cur_title = self._page.title() or self._derive_page_title(cur_url)
-                    if self._history_index < len(self._history) - 1:
-                        self._history_index += 1
-                    try:
-                        webbrowser.open(cur_url)
-                    except Exception:
-                        pass
-                    return BrowserActionResult(
-                        success=True,
-                        message="Going forward to the next page.",
-                        url=cur_url,
-                        title=cur_title,
-                    )
-            except Exception:
-                pass
+        try:
+            prev_url = _normalize_browser_url(self._page.url)
+            resp = self._page.go_forward(wait_until="domcontentloaded", timeout=10000)
+            cur_url = _normalize_browser_url(self._page.url)
+            cur_title = self._page.title() or self._derive_page_title(cur_url)
 
-        if self._history_index >= len(self._history) - 1:
-            current = self._history[self._history_index]
+            # If response is None and the URL didn't change, we are at end of history
+            if resp is None and cur_url == prev_url:
+                return BrowserActionResult(
+                    success=False,
+                    message="You are already at the end of browser navigation history.",
+                    url=cur_url,
+                    title=cur_title,
+                    error="NO_FORWARD_PAGE",
+                )
+
+            return BrowserActionResult(
+                success=True,
+                message="Going forward to the next page.",
+                url=cur_url,
+                title=cur_title,
+            )
+        except Exception as exc:
             return BrowserActionResult(
                 success=False,
-                message="You are already at the end of browser navigation history.",
-                url=current["url"],
-                title=current["title"],
-                error="NO_FORWARD_PAGE",
+                message=f"Failed to navigate forward: {exc}",
+                error=str(exc),
             )
 
-        self._history_index += 1
-        nxt = self._history[self._history_index]
-        try:
-            webbrowser.open(nxt["url"])
-        except Exception:
-            pass
-
-        return BrowserActionResult(
-            success=True,
-            message="Going forward to the next page.",
-            url=nxt["url"],
-            title=nxt["title"],
-        )
-
     def refresh(self) -> BrowserActionResult:
-        """Reload the currently active controlled browser page."""
-        if not self._active or self._history_index < 0 or not self._history:
+        """Reload the currently active controlled Playwright browser page."""
+        if not self.is_active:
             return BrowserActionResult(
                 success=False,
                 message="I don't currently have an active browser session to refresh.",
                 error="NO_ACTIVE_SESSION",
             )
 
-        current = self._history[self._history_index]
-        if self._page is not None and not self._page.is_closed():
-            try:
-                self._page.reload(wait_until="domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-
         try:
-            webbrowser.open(current["url"])
-        except Exception:
-            pass
-
-        return BrowserActionResult(
-            success=True,
-            message="Refreshing the current page.",
-            url=current["url"],
-            title=current["title"],
-        )
+            self._page.reload(wait_until="domcontentloaded", timeout=10000)
+            cur_url = _normalize_browser_url(self._page.url)
+            cur_title = self._page.title()
+            return BrowserActionResult(
+                success=True,
+                message="Refreshing the current page.",
+                url=cur_url,
+                title=cur_title,
+            )
+        except Exception as exc:
+            return BrowserActionResult(
+                success=False,
+                message=f"Failed to refresh page: {exc}",
+                error=str(exc),
+            )
 
     def get_current_page_info(self) -> BrowserActionResult:
-        """Retrieve factual URL and title information of the currently controlled browser page."""
-        if not self._active or self._history_index < 0 or not self._history:
+        """Retrieve factual URL and title information from the actual controlled Playwright page."""
+        if not self.is_active:
             return BrowserActionResult(
                 success=False,
                 message="I don't currently have an active browser session to inspect.",
                 error="NO_ACTIVE_SESSION",
             )
 
-        current = self._history[self._history_index]
-        url = current["url"]
-        title = current["title"]
-
-        if self._page is not None and not self._page.is_closed():
-            try:
-                page_url = self._page.url
-                page_title = self._page.title()
-                if page_url:
-                    url = page_url
-                if page_title:
-                    title = page_title
-            except Exception:
-                pass
-
-        site_name = self._derive_site_name(url)
-        msg = f"You are currently on {site_name}.\nURL: {url}"
-        return BrowserActionResult(
-            success=True,
-            message=msg,
-            url=url,
-            title=title,
-        )
-
-    def get_page_title(self) -> BrowserActionResult:
-        """Retrieve the page title of the currently controlled browser page."""
-        if not self._active or self._history_index < 0 or not self._history:
-            return BrowserActionResult(
-                success=False,
-                message="I don't currently have an active browser session to inspect.",
-                error="NO_ACTIVE_SESSION",
-            )
-
-        current = self._history[self._history_index]
-        title = current["title"]
-        url = current["url"]
-
-        if self._page is not None and not self._page.is_closed():
-            try:
-                page_title = self._page.title()
-                if page_title:
-                    title = page_title
-            except Exception:
-                pass
-
-        return BrowserActionResult(
-            success=True,
-            message=f"The current page is:\n{title}",
-            url=url,
-            title=title,
-        )
-
-    def get_current_url(self) -> BrowserActionResult:
-        """Retrieve the current URL of the currently controlled browser page."""
-        if not self._active or self._history_index < 0 or not self._history:
-            return BrowserActionResult(
-                success=False,
-                message="I don't currently have an active browser session to inspect.",
-                error="NO_ACTIVE_SESSION",
-            )
-
-        current = self._history[self._history_index]
-        url = current["url"]
-        title = current["title"]
-
-        if self._page is not None and not self._page.is_closed():
-            try:
-                page_url = self._page.url
-                if page_url:
-                    url = page_url
-            except Exception:
-                pass
-
-        return BrowserActionResult(
-            success=True,
-            message=f"You are currently at:\n{url}",
-            url=url,
-            title=title,
-        )
-
-    def get_page_content(self) -> BrowserActionResult:
-        """
-        Inspect actual page content of the current page.
-        Uses live Playwright page DOM when active, falling back to safe local HTML parsing.
-        Treated strictly as untrusted text.
-        """
-        if not self._active or self._history_index < 0 or not self._history:
-            return BrowserActionResult(
-                success=False,
-                message="I don't currently have an active browser session to inspect.",
-                error="NO_ACTIVE_SESSION",
-            )
-
-        current = self._history[self._history_index]
-        target_url = current["url"]
-        title = current["title"]
-
-        # 1. Use Playwright live session if available
-        if self._page is not None and not self._page.is_closed():
-            try:
-                # Extract inner text from body
-                body_text = self._page.inner_text("body", timeout=5000)
-                clean_text = " ".join(body_text.split())
-                p_title = self._page.title() or title
-                preview = clean_text[:500] + ("..." if len(clean_text) > 500 else "")
-                return BrowserActionResult(
-                    success=True,
-                    message=f"Page content for {p_title}:\n{preview}",
-                    url=self._page.url or target_url,
-                    title=p_title,
-                    data={"content": preview, "full_length": len(clean_text)},
-                )
-            except Exception:
-                pass
-
-        # 2. Attempt safe inspection of actual webpage content via BeautifulSoup
         try:
-            import urllib.request
-            import bs4
-
-            req = urllib.request.Request(
-                target_url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                html_data = response.read().decode("utf-8", errors="ignore")
-                soup = bs4.BeautifulSoup(html_data, "html.parser")
-                # Remove scripts and styles
-                for script in soup(["script", "style", "noscript"]):
-                    script.extract()
-                text = " ".join(soup.get_text().split())
-                parsed_title = soup.title.string.strip() if soup.title and soup.title.string else title
-                current["title"] = parsed_title
-                preview = text[:500] + ("..." if len(text) > 500 else "")
-                return BrowserActionResult(
-                    success=True,
-                    message=f"Page content for {parsed_title}:\n{preview}",
-                    url=target_url,
-                    title=parsed_title,
-                    data={"content": preview, "full_length": len(text)},
-                )
-        except Exception:
-            # Fallback to structured factual representation of active page without fabricating
-            site_name = self._derive_site_name(target_url)
-            msg = f"Active webpage: {current['title']} ({site_name})\nURL: {target_url}\nPage is open in the controlled browser session."
+            url = _normalize_browser_url(self._page.url)
+            title = self._page.title() or self._derive_page_title(url)
+            site_name = self._derive_site_name(url)
+            msg = f"You are currently on {site_name}.\nURL: {url}"
             return BrowserActionResult(
                 success=True,
                 message=msg,
-                url=target_url,
-                title=current["title"],
-                data={"content": msg},
+                url=url,
+                title=title,
+            )
+        except Exception as exc:
+            return BrowserActionResult(
+                success=False,
+                message=f"Failed to inspect current page: {exc}",
+                error=str(exc),
+            )
+
+    def get_page_title(self) -> BrowserActionResult:
+        """Retrieve the page title of the currently controlled Playwright browser page."""
+        if not self.is_active:
+            return BrowserActionResult(
+                success=False,
+                message="I don't currently have an active browser session to inspect.",
+                error="NO_ACTIVE_SESSION",
+            )
+
+        try:
+            title = self._page.title() or self._derive_page_title(self._page.url)
+            url = _normalize_browser_url(self._page.url)
+            return BrowserActionResult(
+                success=True,
+                message=f"The current page is:\n{title}",
+                url=url,
+                title=title,
+            )
+        except Exception as exc:
+            return BrowserActionResult(
+                success=False,
+                message=f"Failed to get page title: {exc}",
+                error=str(exc),
+            )
+
+    def get_current_url(self) -> BrowserActionResult:
+        """Retrieve the current URL of the currently controlled Playwright browser page."""
+        if not self.is_active:
+            return BrowserActionResult(
+                success=False,
+                message="I don't currently have an active browser session to inspect.",
+                error="NO_ACTIVE_SESSION",
+            )
+
+        try:
+            url = _normalize_browser_url(self._page.url)
+            title = self._page.title() or self._derive_page_title(url)
+            return BrowserActionResult(
+                success=True,
+                message=f"You are currently at:\n{url}",
+                url=url,
+                title=title,
+            )
+        except Exception as exc:
+            return BrowserActionResult(
+                success=False,
+                message=f"Failed to get current URL: {exc}",
+                error=str(exc),
+            )
+
+    def get_page_content(self) -> BrowserActionResult:
+        """
+        Inspect actual page content of the current controlled page directly from live Playwright DOM.
+        Never falls back to urllib/BeautifulSoup or simulated text.
+        """
+        if not self.is_active:
+            return BrowserActionResult(
+                success=False,
+                message="I don't currently have an active browser session to inspect.",
+                error="NO_ACTIVE_SESSION",
+            )
+
+        try:
+            body_text = self._page.inner_text("body", timeout=5000)
+            clean_text = " ".join(body_text.split())
+            p_title = self._page.title() or self._derive_page_title(self._page.url)
+            preview = clean_text[:500] + ("..." if len(clean_text) > 500 else "")
+            return BrowserActionResult(
+                success=True,
+                message=f"Page content for {p_title}:\n{preview}",
+                url=self._page.url,
+                title=p_title,
+                data={"content": preview, "full_length": len(clean_text)},
+            )
+        except Exception as exc:
+            return BrowserActionResult(
+                success=False,
+                message=f"Failed to extract page content from active browser DOM: {exc}",
+                error=str(exc),
             )
 
     def get_visible_links(self) -> BrowserActionResult:
         """
-        Extract visible links from the currently controlled webpage.
-        Uses live Playwright page DOM when active, falling back to safe local HTML parsing.
-        Strictly limits output to first 10 links to maintain bounded resources.
+        Extract visible links directly from the currently controlled Playwright page DOM.
+        Strictly limits output to first 10 links.
+        Never falls back to urllib/BeautifulSoup or simulated links.
         """
-        if not self._active or self._history_index < 0 or not self._history:
+        if not self.is_active:
             return BrowserActionResult(
                 success=False,
                 message="I don't currently have an active browser session to inspect.",
                 error="NO_ACTIVE_SESSION",
             )
 
-        current = self._history[self._history_index]
-        target_url = current["url"]
-
-        # 1. Use Playwright live session if available
-        if self._page is not None and not self._page.is_closed():
-            try:
-                # Query visible anchors from live DOM
-                raw_links = self._page.eval_on_selector_all(
-                    "a[href]",
-                    """elements => elements.map(e => ({
-                        text: e.innerText.trim(),
-                        href: e.href
-                    })).filter(item => item.text && !item.href.startsWith('javascript:') && !item.href.startsWith('#')).slice(0, 10)"""
-                )
-                if raw_links:
-                    links = [(item["text"], item["href"]) for item in raw_links]
-                    lines = [f"Found {len(links)} visible links on {current['title']}:"]
-                    for idx, (t, u) in enumerate(links, 1):
-                        lines.append(f"{idx}. {t} -> {u}")
-                    msg = "\n".join(lines)
-                    return BrowserActionResult(
-                        success=True,
-                        message=msg,
-                        url=self._page.url or target_url,
-                        title=current["title"],
-                        data={"links": links},
-                    )
-            except Exception:
-                pass
-
-        # 2. BeautifulSoup fallback
         try:
-            import urllib.request
-            import bs4
-
-            req = urllib.request.Request(
-                target_url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            raw_links = self._page.eval_on_selector_all(
+                "a[href]",
+                """elements => elements.map(e => ({
+                    text: (e.innerText || e.textContent || '').trim(),
+                    href: e.href
+                })).filter(item => item.text && !item.href.startsWith('javascript:') && !item.href.startsWith('#')).slice(0, 10)"""
             )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                html_data = response.read().decode("utf-8", errors="ignore")
-                soup = bs4.BeautifulSoup(html_data, "html.parser")
-                links = []
-                for a in soup.find_all("a", href=True):
-                    text = a.get_text(strip=True)
-                    href = a["href"]
-                    if text and not href.startswith("#") and not href.startswith("javascript:"):
-                        full_url = urllib.parse.urljoin(target_url, href)
-                        links.append((text, full_url))
-                        if len(links) >= 10:
-                            break
+            links = [(item["text"], item["href"]) for item in (raw_links or [])]
+            cur_title = self._page.title() or self._derive_page_title(self._page.url)
 
-                if links:
-                    lines = [f"Found {len(links)} visible links on {current['title']}:"]
-                    for idx, (t, u) in enumerate(links, 1):
-                        lines.append(f"{idx}. {t} -> {u}")
-                    msg = "\n".join(lines)
-                    return BrowserActionResult(
-                        success=True,
-                        message=msg,
-                        url=target_url,
-                        title=current["title"],
-                        data={"links": links},
-                    )
-        except Exception:
-            pass
+            if links:
+                lines = [f"Found {len(links)} visible links on {cur_title}:"]
+                for idx, (t, u) in enumerate(links, 1):
+                    lines.append(f"{idx}. {t} -> {u}")
+                msg = "\n".join(lines)
+            else:
+                msg = f"No visible links found on {cur_title}."
 
-        site_name = self._derive_site_name(target_url)
-        msg = f"Available navigation for {site_name}:\n- Main Home: {target_url}\n- Back / Forward navigation via browser history."
-        return BrowserActionResult(
-            success=True,
-            message=msg,
-            url=target_url,
-            title=current["title"],
-            data={"links": [(site_name, target_url)]},
-        )
+            return BrowserActionResult(
+                success=True,
+                message=msg,
+                url=self._page.url,
+                title=cur_title,
+                data={"links": links},
+            )
+        except Exception as exc:
+            return BrowserActionResult(
+                success=False,
+                message=f"Failed to extract visible links from active browser DOM: {exc}",
+                error=str(exc),
+            )
 
     def reset_session(self) -> None:
         """Reset the controlled browser session state and close Playwright browser page."""
         self._active = False
-        self._history.clear()
-        self._history_index = -1
         if self._page is not None:
             try:
                 self._page.close()

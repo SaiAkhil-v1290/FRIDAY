@@ -164,7 +164,7 @@ class DesktopController:
     def describe_screen(self) -> DesktopActionResult:
         """
         Capture and analyze screen layout locally (dimensions, display resolution, orientation).
-        Clearly documents hardware limitations: semantic VLM reasoning requires a local vision model.
+        Semantic visual interpretation (understanding images, OCR, UI layout) is NOT yet implemented.
         Strictly local analysis without external cloud transmission.
         """
         cap = self.capture_screen(save=True)
@@ -175,17 +175,17 @@ class DesktopController:
         h = cap.data["height"]
         orientation = "landscape" if w >= h else "portrait"
         
-        # Local structural description without fabricating ungrounded OCR
+        # Local structural description without fabricating ungrounded OCR or visual understanding
         msg = (
             f"Screen captured successfully: {w}x{h} resolution ({orientation} orientation).\n"
             f"Image saved locally to storage.\n"
-            f"Semantic visual captioning requires a local vision-language model."
+            f"Note: Semantic visual interpretation is not yet implemented (requires local vision model)."
         )
         return DesktopActionResult(
             success=True,
             message=msg,
             action="describe_screen",
-            data={**cap.data, "orientation": orientation, "semantic_model": "local_vlm_required"},
+            data={**cap.data, "orientation": orientation, "semantic_understanding": False},
             verified=True,
         )
 

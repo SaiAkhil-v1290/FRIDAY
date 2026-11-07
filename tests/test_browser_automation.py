@@ -89,7 +89,7 @@ class TestBrowserAutomation(unittest.TestCase):
         res1 = self.controller.open_website("https://example.com")
         self.assertTrue(res1.success)
         self.assertEqual(self.controller.get_current_url().url, "https://example.com")
-        self.assertEqual(self.controller.get_page_title().title, "example.com")
+        self.assertIn("Example", self.controller.get_page_title().title)
 
         res2 = self.controller.open_website("https://github.com")
         self.assertTrue(res2.success)

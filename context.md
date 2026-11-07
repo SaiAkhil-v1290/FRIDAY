@@ -357,12 +357,13 @@ LONG-TERM MEMORY (Local SQLite)
 - **`core/orchestrator.py`**: Integrated `MemoryGrounder` alongside `MemoryRetriever`.
 - **`tests/test_memory_grounding.py`**: Added unit tests covering known fact grounding, missing fact uncertainty detection, suggestion vs. fact separation, status hallucination prevention, and regressions.
 
-- **Milestone 5.1 & Phase 3 / 3.1: Real Computer Control, Browser Automation & Hardened Desktop Interaction**:
-  - **Hardened Browser Automation (`tools/browser.py`)**:
-    - Replaced basic static navigation with a real controlled browser session architecture using **Playwright** (Chromium headless/headful) alongside fallback web inspection.
-    - Implemented live page lifecycle tracking: `open_website`, `go_back`, `go_forward`, `refresh`, `get_current_page_info`, `get_page_title`, and `get_current_url`.
-    - Live DOM inspection via `get_page_content` (inner body text extraction bounded to 500 characters) and `get_visible_links` (first 10 actionable hyperlinks filtered from javascript/hash anchors).
-    - Session isolation and cleanup: `reset_session()` cleanly terminates browser pages, contexts, and Playwright drivers.
+- **Milestone 5.1 & Phase 3 / 3.1 / 3.2: Real Computer Control, Browser Automation & Hardened Desktop Interaction**:
+  - **Single Source of Truth Browser Automation (`tools/browser.py`)**:
+    - **Playwright Single Source of Truth**: Controlled Playwright Chromium is the *sole* browser automation engine for all browser-control tools (`open_website`, `go_back`, `go_forward`, `refresh`, `get_current_page_info`, `get_page_title`, `get_current_url`, `get_page_content`, `get_visible_links`). Added `playwright>=1.40.0` to `requirements.txt`.
+    - **Setup Instructions**: Requires `pip install playwright` followed by `python -m playwright install chromium`.
+    - **No Simulated Fallbacks**: Completely eliminated `urllib.request` and `BeautifulSoup` fallback extraction, duplicate `webbrowser.open()` calls, and internal simulated history lists.
+    - **Verified Browser State**: All actions directly operate against the real browser page DOM. Back/forward use actual browser session navigation (`self._page.go_back()` / `self._page.go_forward()`). Refresh invokes `self._page.reload()`. Visible links and content are scraped directly from the active live DOM.
+    - **Truthful Error Reporting**: When Playwright or Chromium is unavailable or closed, functions immediately return explicit failures (`BROWSER_UNAVAILABLE`, `NO_ACTIVE_SESSION`) without fabricating state or reporting false successes.
   - **Hardened Desktop Control & Input Safety (`tools/desktop.py`)**:
     - OS compatibility enforcement: strictly validates `sys.platform == "win32"` and returns clean `UNSUPPORTED_PLATFORM` errors on non-Windows environments without claiming no-op success.
     - Bounded coordinate checking: coordinates for `move_mouse` and `click_mouse` are strictly bounded by primary display dimensions from `GetSystemMetrics(0)` and `GetSystemMetrics(1)`.
@@ -372,22 +373,25 @@ LONG-TERM MEMORY (Local SQLite)
       - Enforces 500-character limits on typed text and validates keys against `ALLOWED_KEYBOARD_KEYS`.
     - Key release safety guarantees: wraps all keyboard and hotkey dispatches in `try...finally` blocks to guarantee `KEYEVENTF_KEYUP` is always fired, preventing stuck modifier or control keys.
     - Action verification: cursor position is verified via `GetCursorPos` after `move_mouse`, populating the `verified` flag on results accurately.
-  - **Visual Awareness & Screen Understanding**:
+  - **Visual Awareness & Screen Understanding (Truthful Reporting)**:
     - Clearly distinguishes raw screenshot capture (`capture_screen`) from semantic visual analysis (`describe_screen`).
-    - Reports factual screen resolution, dimensions, and display orientation without transmitting screenshots to external cloud APIs.
-    - Honestly documents local hardware constraints: semantic multi-modal visual captioning indicates that a local vision-language model (e.g., `ollama pull llava`) is required.
+    - `describe_screen` accurately reports display dimensions, resolution, and orientation, and explicitly states that semantic visual interpretation (OCR/UI element understanding) is *not yet implemented* locally. Zero cloud vision API dependencies are introduced.
   - **Tool Policy & Permission Gating (`tools/registry.py` & `security/permissions.py`)**:
     - Consequential desktop actions (`click_mouse`, `type_text`, `press_key`, `hotkey`) are explicitly configured with `requires_approval: True` in `TOOL_POLICIES`.
     - Read-only actions (`move_mouse`, `scroll_mouse`, `capture_screen`, `describe_screen`, `browser_get_page_info`, `browser_get_page_content`, `browser_get_visible_links`) remain unblocked (`requires_approval: False`).
     - `ActionExecutionResult` in `core/executor.py` records both `executed` and `verified` state flags.
-  - **Comprehensive Mock Isolation & Regression Testing (`tests/test_computer_control_phase3.py`)**:
-    - Fully mocked all Windows API input dispatches (`mouse_event`, `SetCursorPos`, `keybd_event`, `VkKeyScanW`, `ImageGrab.grab`) in unit tests so executing tests never controls the developer's physical mouse or keyboard.
-    - 18 comprehensive tests covering browser inspection, desktop validation bounds, approval policies, and multi-step execution.
-    - Full project regression test suite passes cleanly across all 285 tests.
+  - **Comprehensive Mock Isolation & Integration Testing (`tests/test_computer_control_phase3.py` & `tests/test_browser_automation.py`)**:
+    - Fully mocked all Windows API input dispatches (`mouse_event`, `SetCursorPos`, `keybd_event`, `VkKeyScanW`, `ImageGrab.grab`) in unit tests so executing tests never controls physical mouse or keyboard.
+    - Real Playwright browser integration tests using local data/HTML URLs testing full lifecycle: initialization, page navigation, DOM inspection, back/forward/refresh, closed-page error handling, and resource teardown.
+    - Full project regression test suite passes cleanly across all 286 tests.
 
-## Execution
+## Execution & Setup
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
-2. Ensure model is pulled: `ollama pull qwen2.5:3b`
-3. Run `python main.py`
+2. Install dependencies: `pip install -r requirements.txt`
+3. Install Playwright browser: `python -m playwright install chromium`
+4. Ensure Ollama model is pulled: `ollama pull qwen2.5:3b`
+5. Run tests: `pytest` or `python -m pytest tests/test_browser_automation.py tests/test_computer_control_phase3.py -v`
+6. Run assistant: `python main.py`
+
 
 

@@ -1578,7 +1578,7 @@ def extract_browser_navigation_target(text: str) -> str | None:
 
     # Match "open/go to/navigate to/visit <target>"
     m = re.match(
-        r"^(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?(?:open(?:\s+a\s+website|\s+the\s+website)?|go\s+to|navigate\s+to|visit)\s+([a-zA-Z0-9_.:/\\-]+?)\??$",
+        r"^(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?(?:open(?:\s+a\s+website|\s+the\s+website)?|go\s+to|navigate\s+to|visit)\s+(.+?)\??$",
         cleaned,
         re.IGNORECASE,
     )

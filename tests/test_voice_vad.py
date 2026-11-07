@@ -221,6 +221,105 @@ class TestVoiceActivityDetector(unittest.TestCase):
         self.assertEqual(vad.config.silence_rms_threshold, 200.0)
         self.assertEqual(vad.config.speech_rms_threshold, 600.0)
 
+    def test_pre_speech_truncation_reporting_and_speech_start(self):
+        """Verify that pre-speech truncation is tracked, emitted as buffer_overflow, and reported on speech_start."""
+        # max_pre_speech_duration_ms = 40 (2 frames = 1280 bytes)
+        # vad_min_speech_duration_ms = 80 (4 frames needed to confirm speech)
+        cfg = VoiceConfig(
+            sample_rate=16000,
+            frame_duration_ms=20,
+            max_pre_speech_duration_ms=40,
+            vad_min_speech_duration_ms=80,
+            vad_silence_duration_ms=40,
+        )
+        vad = VoiceActivityDetector(cfg)
+
+        # Feed 3 speech frames (60ms < 80ms)
+        overflow_events = []
+        for _ in range(3):
+            evs = vad.process_frame(self.speech_frame)
+            overflow_events.extend([e for e in evs if e.event_type == "buffer_overflow"])
+
+        # Pre-speech buffer overflow must emit buffer_overflow event with pre_speech_truncated=True
+        self.assertEqual(len(overflow_events), 1)
+        self.assertTrue(overflow_events[0].truncated)
+        self.assertTrue(overflow_events[0].pre_speech_truncated)
+        self.assertTrue(vad.is_pre_speech_truncated)
+        self.assertTrue(vad.is_truncated)
+        self.assertFalse(vad.is_speech_active)
+        self.assertEqual(vad.pre_speech_buffered_bytes, cfg.max_pre_speech_bytes)
+
+        # 4th speech frame reaches min_speech_duration (80ms), triggering speech_start
+        start_evs = vad.process_frame(self.speech_frame)
+        self.assertTrue(vad.is_speech_active)
+        start_event = [e for e in start_evs if e.event_type == "speech_start"][0]
+        # speech_start MUST report pre_speech_truncated=True so caller knows onset is incomplete
+        self.assertTrue(start_event.pre_speech_truncated)
+        self.assertTrue(start_event.truncated)
+
+        # Feed silence frames (40ms = 2 frames) to end speech
+        end_evs = []
+        for _ in range(2):
+            evs = vad.process_frame(self.silence_frame)
+            end_evs.extend([e for e in evs if e.event_type == "speech_end"])
+
+        self.assertEqual(len(end_evs), 1)
+        # speech_end must report pre_speech_truncated
+        self.assertTrue(end_evs[0].pre_speech_truncated)
+        self.assertTrue(end_evs[0].truncated)
+
+        # After speech_end, truncation state resets
+        self.assertFalse(vad.is_pre_speech_truncated)
+        self.assertFalse(vad.is_truncated)
+        self.assertFalse(vad.is_speech_active)
+
+    def test_pre_speech_truncation_cleared_on_reset(self):
+        """Verify that reset() clears pre-speech truncation flags cleanly."""
+        cfg = VoiceConfig(
+            sample_rate=16000,
+            frame_duration_ms=20,
+            max_pre_speech_duration_ms=40,
+            vad_min_speech_duration_ms=80,
+        )
+        vad = VoiceActivityDetector(cfg)
+
+        # Feed 3 speech frames to cause pre-speech overflow
+        for _ in range(3):
+            vad.process_frame(self.speech_frame)
+        self.assertTrue(vad.is_pre_speech_truncated)
+        self.assertTrue(vad.is_truncated)
+
+        vad.reset()
+        self.assertFalse(vad.is_pre_speech_truncated)
+        self.assertFalse(vad.is_truncated)
+        self.assertEqual(vad.pre_speech_buffered_bytes, 0)
+
+    def test_normal_speech_no_pre_speech_truncation(self):
+        """Verify that un-truncated normal speech onset has pre_speech_truncated=False."""
+        cfg = VoiceConfig(
+            sample_rate=16000,
+            frame_duration_ms=20,
+            max_pre_speech_duration_ms=500,
+            vad_min_speech_duration_ms=40,
+            vad_silence_duration_ms=40,
+        )
+        vad = VoiceActivityDetector(cfg)
+
+        # 2 frames = 40ms = reaches min_speech_duration
+        vad.process_frame(self.speech_frame)
+        evs2 = vad.process_frame(self.speech_frame)
+        start_event = [e for e in evs2 if e.event_type == "speech_start"][0]
+        self.assertFalse(start_event.pre_speech_truncated)
+        self.assertFalse(start_event.truncated)
+        self.assertFalse(vad.is_pre_speech_truncated)
+
+        # End speech
+        for _ in range(2):
+            evs_end = vad.process_frame(self.silence_frame)
+        end_event = [e for e in evs_end if e.event_type == "speech_end"][0]
+        self.assertFalse(end_event.pre_speech_truncated)
+        self.assertFalse(end_event.truncated)
+
     def test_reset(self):
         cfg = VoiceConfig(
             sample_rate=16000,

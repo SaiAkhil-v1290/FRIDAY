@@ -5,6 +5,7 @@ non-deadlocking playback cancellation, safe capture shutdown, and complete mocka
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 import queue
 import threading
 import time
@@ -179,15 +180,22 @@ class SoundDeviceInputSource(AudioInputSource):
             raise AudioDeviceError(f"Microphone disconnected or read error: {exc}") from exc
 
     def close(self) -> None:
+        """
+        Close the active input stream.
+        Note: PortAudio C API is not reentrant across threads. Closing or aborting a stream
+        while another thread is actively executing a blocking Pa_ReadStream call can lead
+        to backend driver warnings or errors on non-compliant host APIs.
+        Setting active to False beforehand ensures the reader thread aborts promptly.
+        """
+        self._active = False
         if self._stream is not None:
             try:
-                self._stream.stop()
+                self._stream.abort()
                 self._stream.close()
             except Exception:
                 pass
             finally:
                 self._stream = None
-                self._active = False
 
     @property
     def is_active(self) -> bool:
@@ -411,9 +419,11 @@ class AudioCaptureService:
     def stop(self) -> None:
         """
         Cleanly and deterministically halt audio capture and release resources.
+        Avoids holding lifecycle locks while waiting for the worker thread.
         Releases the input source before joining the worker thread to unblock reads.
         Idempotent: safe to call multiple times.
         """
+        worker_to_join: threading.Thread | None = None
         with self._lifecycle_lock:
             if not self._running and (self._worker_thread is None or not self._worker_thread.is_alive()):
                 return
@@ -427,11 +437,14 @@ class AudioCaptureService:
             except Exception:
                 pass
 
-            # 3. Wait for the worker to terminate
-            if self._worker_thread is not None and self._worker_thread.is_alive():
-                self._worker_thread.join(timeout=1.0)
+            worker_to_join = self._worker_thread
 
-            # 4. Do not discard worker reference while thread remains alive
+        # 3. Wait for the worker to terminate WITHOUT holding _lifecycle_lock
+        if worker_to_join is not None and worker_to_join.is_alive():
+            worker_to_join.join(timeout=1.0)
+
+        # 4. Finalize state under lock; preserve worker reference if it failed to terminate
+        with self._lifecycle_lock:
             if self._worker_thread is not None and self._worker_thread.is_alive():
                 self._running = False
                 raise AudioDeviceError(
@@ -448,14 +461,27 @@ class AudioCaptureService:
 
 
 # =============================================================================
-# 5. Audio Playback Service (Immediate Cancellation, Non-Blocking Interruptible)
+# 5. Audio Playback Service (Immediate Cancellation, Session Ownership)
 # =============================================================================
+
+@dataclass
+class _PlaybackSession:
+    """Represents an active or completing playback session."""
+    session_id: int
+    data: bytes
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    done_event: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    is_blocking: bool = False
+    error: Exception | None = None
+
 
 class AudioPlaybackService:
     """
-    Manages non-blocking and interruptible blocking audio playback.
+    Manages non-blocking and interruptible blocking audio playback with strict session ownership.
     Guarantees no overlapping playback sessions, supports instant non-deadlocking
-    cancellation, and rejects starting new playback if prior workers fail to terminate.
+    cancellation, prevents stale workers from altering active playback state, and
+    rejects starting new playback if prior sessions fail to terminate.
     """
 
     def __init__(
@@ -467,14 +493,23 @@ class AudioPlaybackService:
         self.sink = sink or SoundDeviceOutputSink(self.config)
 
         self._playback_lock = threading.Lock()
-        self._worker_thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
-        self._is_playing = False
+        self._current_session: _PlaybackSession | None = None
+        self._session_counter = 0
         self._last_error: Exception | None = None
 
     @property
     def is_playing(self) -> bool:
-        return self._is_playing
+        """Return True if a playback session is currently in progress."""
+        with self._playback_lock:
+            return self._current_session is not None and not self._current_session.done_event.is_set()
+
+    @property
+    def _worker_thread(self) -> threading.Thread | None:
+        """Backward-compatible access to current active playback thread."""
+        with self._playback_lock:
+            if self._current_session is not None and not self._current_session.done_event.is_set():
+                return self._current_session.thread
+            return None
 
     @property
     def last_error(self) -> Exception | None:
@@ -483,9 +518,10 @@ class AudioPlaybackService:
     def play(self, pcm_data: bytes, non_blocking: bool = True) -> None:
         """
         Play raw 16-bit PCM audio.
-        If a playback session is already active, it is aborted before starting.
-        If cancellation cannot be completed safely within timeout, rejects the new playback.
-        Does not hold playback lock across blocking playback, allowing external interruption.
+        Guarantees that every playback session (blocking or non-blocking) is tracked.
+        Prevents a new session from starting while an earlier session is still writing.
+        Ensures stop() can interrupt either playback mode.
+        Ensures cancellation cannot allow a stale worker/session to write after a new session starts.
         """
         if not pcm_data:
             raise ValueError("Cannot play empty audio data.")
@@ -496,70 +532,95 @@ class AudioPlaybackService:
             )
 
         with self._playback_lock:
-            # Prevent overlapping playback sessions: abort any existing playback
-            if self._is_playing or (self._worker_thread is not None and self._worker_thread.is_alive()):
-                self._abort_internal()
-                if self._worker_thread is not None and self._worker_thread.is_alive():
-                    # Cancellation could not be completed safely
+            # Prevent overlapping playback sessions: abort any existing playback and wait for it to exit
+            if self._current_session is not None and not self._current_session.done_event.is_set():
+                self._abort_session_under_lock()
+                if self._current_session is not None and not self._current_session.done_event.is_set():
+                    # Cancellation could not be completed safely within timeout
                     raise AudioDeviceError(
-                        "Cannot start playback: previous playback worker is still active and failed to cancel."
+                        "Cannot start playback: previous playback session is still active and failed to cancel."
                     )
 
-            self._stop_event.clear()
+            self._session_counter += 1
+            session = _PlaybackSession(
+                session_id=self._session_counter,
+                data=pcm_data,
+                is_blocking=not non_blocking,
+            )
+            self._current_session = session
             self._last_error = None
-            self._is_playing = True
 
             if non_blocking:
-                self._worker_thread = threading.Thread(
-                    target=self._playback_worker,
-                    args=(pcm_data,),
-                    name="JarvisAudioPlaybackWorker",
+                worker = threading.Thread(
+                    target=self._play_session,
+                    args=(session,),
+                    name=f"JarvisAudioPlaybackWorker-{session.session_id}",
                     daemon=True,
                 )
-                self._worker_thread.start()
+                session.thread = worker
+                worker.start()
                 return
 
-        # Blocking playback runs OUTSIDE _playback_lock so another thread can call stop() without deadlocking!
-        self._play_internal(pcm_data)
+        # Blocking playback runs on the calling thread outside _playback_lock
+        session.thread = threading.current_thread()
+        self._play_session(session)
 
-    def _playback_worker(self, pcm_data: bytes) -> None:
-        self._play_internal(pcm_data)
-
-    def _play_internal(self, pcm_data: bytes) -> None:
-        """Chunked playback loop allowing immediate mid-stream cancellation."""
+    def _play_session(self, session: _PlaybackSession) -> None:
+        """Chunked playback loop bound to a specific session."""
         chunk_bytes = self.config.frame_bytes
-        total_len = len(pcm_data)
+        total_len = len(session.data)
         offset = 0
 
         try:
             if not self.sink.is_active:
                 self.sink.open()
 
-            while offset < total_len and not self._stop_event.is_set():
+            while (
+                offset < total_len
+                and not session.stop_event.is_set()
+                and self._current_session is session
+            ):
                 end = min(offset + chunk_bytes, total_len)
-                chunk = pcm_data[offset:end]
+                chunk = session.data[offset:end]
                 self.sink.write(chunk)
                 offset = end
 
         except Exception as exc:
+            session.error = exc
             self._last_error = exc
         finally:
-            self._is_playing = False
+            # Mark session as done writing FIRST so waiting abort callers immediately unblock
+            session.done_event.set()
+            with self._playback_lock:
+                if self._current_session is session:
+                    self._current_session = None
 
-    def _abort_internal(self) -> None:
+    def _abort_session_under_lock(self) -> None:
         """Internal abort routine called under lock."""
-        self._stop_event.set()
-        self.sink.stop()
-        if self._worker_thread is not None and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=1.0)
-        if self._worker_thread is not None and not self._worker_thread.is_alive():
-            self._worker_thread = None
-        self._is_playing = False
+        session = self._current_session
+        if session is None or session.done_event.is_set():
+            self._current_session = None
+            return
+
+        session.stop_event.set()
+        try:
+            self.sink.stop()
+        except Exception:
+            pass
+
+        # If the session is executing on the current thread, do not self-deadlock
+        if session.thread is threading.current_thread():
+            return
+
+        session.done_event.wait(timeout=1.0)
+        if session.done_event.is_set():
+            if self._current_session is session:
+                self._current_session = None
 
     def stop(self) -> None:
         """Immediately stop and abort active playback (Barge-in / Interruption)."""
         with self._playback_lock:
-            self._abort_internal()
+            self._abort_session_under_lock()
 
     def abort(self) -> None:
         """Alias for stop()."""
@@ -568,5 +629,8 @@ class AudioPlaybackService:
     def shutdown(self) -> None:
         """Deterministic, idempotent shutdown closing output sink."""
         with self._playback_lock:
-            self._abort_internal()
-            self.sink.close()
+            self._abort_session_under_lock()
+            try:
+                self.sink.close()
+            except Exception:
+                pass

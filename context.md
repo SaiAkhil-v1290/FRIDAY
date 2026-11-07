@@ -357,6 +357,27 @@ LONG-TERM MEMORY (Local SQLite)
     - 100% headless mock testing without physical microphone or speaker hardware dependencies.
     - Total test suite: 308 tests passing across the entire project.
 
+- **Milestone 5.1.1.3**: Final Audio Concurrency & VAD Edge-Case Hardening:
+  - **Blocking Playback Session Ownership**:
+    - Introduced `_PlaybackSession` dataclass tracking every playback request with a monotonic `session_id`, dedicated `stop_event`, `done_event`, thread handle, and blocking/non-blocking mode metadata.
+    - Prevents new playback sessions from starting while an earlier session is still writing to the sink (`session.done_event.wait(timeout=1.0)`).
+    - Session-isolated cancellation: stale workers or aborted caller threads cannot alter active playback state or clear the newer session's reference (`if self._current_session is session:`).
+    - Preserves non-blocking and blocking playback APIs with zero concurrent writes to the same sink.
+  - **VAD Pre-Speech Truncation Reporting**:
+    - Explicit tracking of discarded pre-speech onset frames: added `is_pre_speech_truncated` property and `pre_speech_truncated` flag on `VADEvent`.
+    - When `_pre_speech_buffer` exceeds `max_pre_speech_bytes`, excess older frames are removed and a `buffer_overflow` event is emitted with `pre_speech_truncated=True`.
+    - `speech_start` and `speech_end` events explicitly carry `pre_speech_truncated=True`, ensuring callers can detect that the onset of an utterance may be incomplete.
+    - Truncation state persists across silence frames during an active utterance and is cleanly reset between distinct utterances and upon `reset()`.
+  - **Audio Capture Shutdown Review & Hardware Limitations**:
+    - `AudioCaptureService.stop()` releases `_lifecycle_lock` before joining the background worker thread, eliminating deadlocks where concurrent lifecycle checks block on worker termination.
+    - Bounded join timeout (1.0s); if a worker fails to exit, its reference is preserved, `_running = False`, and `AudioDeviceError` is raised.
+    - Documented backend limitations: PortAudio C backends (WASAPI, DirectSound, ALSA, CoreAudio) are not strictly reentrant across threads. Concurrent `abort()` or `close()` on a stream executing a blocking C read (`Pa_ReadStream`) can occasionally cause backend driver errors on non-compliant hardware drivers. Marking `_active = False` before `abort()` mitigates this at the application layer.
+  - **Testing & Verification**:
+    - `tests/test_voice_audio_io.py`: 34 unit and integration tests (added tests for second playback while blocking is active, concurrent stop/play barriers, cancellation while sink write is blocked, no concurrent writes, stale worker isolation, and lock release during capture join).
+    - `tests/test_voice_vad.py`: 16 unit and integration tests (added tests for pre-speech overflow events, pre-speech truncation reporting on speech-start and speech-end, reset behavior, and un-truncated normal speech).
+    - Total voice tests: 50 passed in 14.59s.
+    - Total project test suite: 317 passed in 75.86s with zero regressions.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

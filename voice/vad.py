@@ -28,6 +28,7 @@ class VADEvent:
     duration_ms: float
     accumulated_audio: bytes | None = None
     truncated: bool = False
+    pre_speech_truncated: bool = False
 
 
 class VoiceActivityDetector:
@@ -45,6 +46,7 @@ class VoiceActivityDetector:
 
         self._is_speech_active = False
         self._is_truncated = False
+        self._is_pre_speech_truncated = False
         self._speech_accumulated_ms = 0.0
         self._silence_accumulated_ms = 0.0
         self._speech_buffer = bytearray()
@@ -66,8 +68,13 @@ class VoiceActivityDetector:
 
     @property
     def is_truncated(self) -> bool:
-        """Return True if the currently accumulated utterance has been truncated due to buffer limits."""
-        return self._is_truncated
+        """Return True if either pre-speech or utterance audio was truncated due to buffer limits."""
+        return self._is_truncated or self._is_pre_speech_truncated
+
+    @property
+    def is_pre_speech_truncated(self) -> bool:
+        """Return True if pre-speech onset audio for the current utterance was truncated."""
+        return self._is_pre_speech_truncated
 
     @property
     def buffered_duration_sec(self) -> float:
@@ -159,10 +166,22 @@ class VoiceActivityDetector:
 
             if not self._is_speech_active:
                 self._pre_speech_buffer.extend(frame)
-                # Bound pre-speech buffer to max_pre_speech_bytes
+                # Bound pre-speech buffer to max_pre_speech_bytes and report truncation explicitly
                 if len(self._pre_speech_buffer) > self.config.max_pre_speech_bytes:
                     excess = len(self._pre_speech_buffer) - self.config.max_pre_speech_bytes
                     del self._pre_speech_buffer[:excess]
+                    if not self._is_pre_speech_truncated:
+                        self._is_pre_speech_truncated = True
+                        events.append(
+                            VADEvent(
+                                event_type="buffer_overflow",
+                                timestamp_ms=timestamp,
+                                frame=frame,
+                                duration_ms=frame_duration,
+                                truncated=True,
+                                pre_speech_truncated=True,
+                            )
+                        )
 
                 if self._speech_accumulated_ms >= self.config.vad_min_speech_duration_ms:
                     self._is_speech_active = True
@@ -182,6 +201,7 @@ class VoiceActivityDetector:
                                     frame=frame,
                                     duration_ms=frame_duration,
                                     truncated=True,
+                                    pre_speech_truncated=self._is_pre_speech_truncated,
                                 )
                             )
                     self._pre_speech_buffer.clear()
@@ -191,7 +211,8 @@ class VoiceActivityDetector:
                             timestamp_ms=timestamp,
                             frame=frame,
                             duration_ms=frame_duration,
-                            truncated=self._is_truncated,
+                            truncated=self.is_truncated,
+                            pre_speech_truncated=self._is_pre_speech_truncated,
                         )
                     )
             else:
@@ -211,6 +232,7 @@ class VoiceActivityDetector:
                                 frame=frame,
                                 duration_ms=frame_duration,
                                 truncated=True,
+                                pre_speech_truncated=self._is_pre_speech_truncated,
                             )
                         )
 
@@ -220,13 +242,16 @@ class VoiceActivityDetector:
                     timestamp_ms=timestamp,
                     frame=frame,
                     duration_ms=frame_duration,
-                    truncated=self._is_truncated,
+                    truncated=self.is_truncated,
+                    pre_speech_truncated=self._is_pre_speech_truncated,
                 )
             )
 
         else:
             self._speech_accumulated_ms = 0.0
-            self._pre_speech_buffer.clear()
+            if not self._is_speech_active:
+                self._pre_speech_buffer.clear()
+                self._is_pre_speech_truncated = False
 
             if self._is_speech_active:
                 self._silence_accumulated_ms += frame_duration
@@ -247,6 +272,7 @@ class VoiceActivityDetector:
                                 frame=frame,
                                 duration_ms=frame_duration,
                                 truncated=True,
+                                pre_speech_truncated=self._is_pre_speech_truncated,
                             )
                         )
 
@@ -254,10 +280,12 @@ class VoiceActivityDetector:
                 if self._silence_accumulated_ms >= float(self.config.vad_silence_duration_ms):
                     self._is_speech_active = False
                     accumulated_audio = bytes(self._speech_buffer)
-                    was_truncated = self._is_truncated
+                    was_truncated = self.is_truncated
+                    was_pre_speech_truncated = self._is_pre_speech_truncated
                     self._speech_buffer.clear()
                     self._silence_accumulated_ms = 0.0
                     self._is_truncated = False
+                    self._is_pre_speech_truncated = False
 
                     events.append(
                         VADEvent(
@@ -267,6 +295,7 @@ class VoiceActivityDetector:
                             duration_ms=frame_duration,
                             accumulated_audio=accumulated_audio,
                             truncated=was_truncated,
+                            pre_speech_truncated=was_pre_speech_truncated,
                         )
                     )
                 else:
@@ -276,7 +305,8 @@ class VoiceActivityDetector:
                             timestamp_ms=timestamp,
                             frame=frame,
                             duration_ms=frame_duration,
-                            truncated=self._is_truncated,
+                            truncated=self.is_truncated,
+                            pre_speech_truncated=self._is_pre_speech_truncated,
                         )
                     )
             else:
@@ -287,6 +317,7 @@ class VoiceActivityDetector:
                         frame=frame,
                         duration_ms=frame_duration,
                         truncated=False,
+                        pre_speech_truncated=False,
                     )
                 )
 
@@ -297,12 +328,14 @@ class VoiceActivityDetector:
         audio = bytes(self._speech_buffer)
         self._speech_buffer.clear()
         self._is_truncated = False
+        self._is_pre_speech_truncated = False
         return audio
 
     def reset(self) -> None:
         """Reset internal state, counters, truncation flags, and volatile speech buffer."""
         self._is_speech_active = False
         self._is_truncated = False
+        self._is_pre_speech_truncated = False
         self._speech_accumulated_ms = 0.0
         self._silence_accumulated_ms = 0.0
         self._speech_buffer.clear()

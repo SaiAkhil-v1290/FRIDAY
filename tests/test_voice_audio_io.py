@@ -459,6 +459,274 @@ class TestCaptureShutdownAndWorkerSafety(unittest.TestCase):
         hang_event.set()
         src._active = False
 
+    def test_capture_stop_does_not_hold_lifecycle_lock_during_worker_join(self):
+        """Verify that AudioCaptureService.stop() releases _lifecycle_lock while waiting for worker join."""
+        delay_worker_exit = threading.Event()
+        stop_called_event = threading.Event()
+        lock_acquired_during_join = threading.Event()
+
+        class DelayedStopSource(AudioInputSource):
+            def __init__(self):
+                self._active = False
+
+            def open(self):
+                self._active = True
+
+            def read(self, num_samples):
+                if stop_called_event.is_set():
+                    delay_worker_exit.wait(timeout=1.0)
+                    raise AudioReadError("Stopped")
+                time.sleep(0.005)
+                return b"\x00\x00" * num_samples
+
+            def close(self):
+                self._active = False
+                stop_called_event.set()
+
+            @property
+            def is_active(self):
+                return self._active
+
+        src = DelayedStopSource()
+        cfg = VoiceConfig(frame_duration_ms=10)
+        service = AudioCaptureService(source=src, config=cfg)
+        service.start()
+
+        # Thread 1: calls stop()
+        def do_stop():
+            service.stop()
+
+        t1 = threading.Thread(target=do_stop, daemon=True)
+        t1.start()
+
+        # Wait until stop has closed source and is waiting on join
+        self.assertTrue(stop_called_event.wait(timeout=1.0))
+        time.sleep(0.01)
+
+        # Thread 2: tries to acquire _lifecycle_lock while worker is still joining
+        # If stop() holds the lock during join, this attempt would block
+        acquired = service._lifecycle_lock.acquire(timeout=0.2)
+        if acquired:
+            service._lifecycle_lock.release()
+            lock_acquired_during_join.set()
+
+        # Unblock worker exit
+        delay_worker_exit.set()
+        t1.join(timeout=1.0)
+
+        self.assertTrue(
+            lock_acquired_during_join.is_set(),
+            "AudioCaptureService.stop() held _lifecycle_lock during worker join!",
+        )
+
+
+class ConcurrencyTrackingSink(MockAudioOutputSink):
+    """Sink that detects and tracks concurrent writes."""
+
+    def __init__(self, write_delay_ms: float = 0.005) -> None:
+        super().__init__()
+        self.lock = threading.Lock()
+        self.active_writers = 0
+        self.max_concurrent_writers = 0
+        self.write_delay = write_delay_ms / 1000.0
+
+    def write(self, pcm_data: bytes) -> None:
+        with self.lock:
+            self.active_writers += 1
+            if self.active_writers > self.max_concurrent_writers:
+                self.max_concurrent_writers = self.active_writers
+        try:
+            if self.write_delay > 0:
+                time.sleep(self.write_delay)
+            super().write(pcm_data)
+        finally:
+            with self.lock:
+                self.active_writers -= 1
+
+
+class TestPlaybackConcurrencyAndSessionOwnership(unittest.TestCase):
+    """Deterministic tests for session ownership, cancellation, and concurrency control."""
+
+    def setUp(self):
+        self.config = VoiceConfig(frame_duration_ms=10)
+        self.sink = ConcurrencyTrackingSink(write_delay_ms=2.0)
+        self.service = AudioPlaybackService(sink=self.sink, config=self.config)
+
+    def tearDown(self):
+        self.service.shutdown()
+
+    def test_second_playback_while_blocking_playback_active(self):
+        """Verify that starting a second playback while blocking playback is active aborts the first cleanly."""
+        long_audio1 = b"\x01\x00" * 3200  # 10 chunks of 320 samples
+        audio2 = b"\x02\x00" * 640        # 2 chunks
+
+        write_started_event = threading.Event()
+        t1_finished_event = threading.Event()
+        t2_finished_event = threading.Event()
+
+        # Wrap sink.write to signal when first chunk of audio1 begins
+        orig_write = self.sink.write
+
+        def instrumented_write(chunk):
+            if chunk[:2] == b"\x01\x00":
+                write_started_event.set()
+            orig_write(chunk)
+
+        self.sink.write = instrumented_write
+
+        def run_thread1():
+            self.service.play(long_audio1, non_blocking=False)
+            t1_finished_event.set()
+
+        def run_thread2():
+            # Wait until thread1 has actually begun writing
+            self.assertTrue(write_started_event.wait(timeout=1.0))
+            self.service.play(audio2, non_blocking=False)
+            t2_finished_event.set()
+
+        t1 = threading.Thread(target=run_thread1, daemon=True)
+        t2 = threading.Thread(target=run_thread2, daemon=True)
+
+        t1.start()
+        t2.start()
+
+        self.assertTrue(t1_finished_event.wait(timeout=2.0), "Thread 1 failed to return after abort.")
+        self.assertTrue(t2_finished_event.wait(timeout=2.0), "Thread 2 failed to complete.")
+
+        # Ensure no concurrent writes occurred
+        self.assertEqual(self.sink.max_concurrent_writers, 1)
+        # Ensure audio2 completed as the active session
+        self.assertEqual(self.sink.written_chunks[-1][:2], b"\x02\x00")
+
+    def test_concurrent_stop_and_play_requests(self):
+        """Verify concurrent stop and play requests resolve deterministically without deadlock."""
+        num_threads = 6
+        barrier = threading.Barrier(num_threads)
+        errors = []
+
+        audio = b"\x01\x00" * 320
+
+        def worker_task(idx):
+            try:
+                barrier.wait(timeout=2.0)
+                if idx % 2 == 0:
+                    self.service.play(audio, non_blocking=True)
+                else:
+                    self.service.stop()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker_task, args=(i,), daemon=True) for i in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=2.0)
+
+        self.assertEqual(len(errors), 0, f"Encountered concurrency errors: {errors}")
+        self.assertLessEqual(self.sink.max_concurrent_writers, 1)
+
+    def test_cancellation_while_sink_write_is_blocked(self):
+        """Verify that stop() safely unblocks and cancels a session while sink.write() is waiting."""
+        write_entered_event = threading.Event()
+        write_unblock_event = threading.Event()
+        t1_finished_event = threading.Event()
+
+        class BlockableSink(MockAudioOutputSink):
+            def write(self, pcm_data):
+                write_entered_event.set()
+                write_unblock_event.wait(timeout=2.0)
+                super().write(pcm_data)
+
+            def stop(self):
+                super().stop()
+                write_unblock_event.set()
+
+        blockable_sink = BlockableSink()
+        service = AudioPlaybackService(sink=blockable_sink, config=self.config)
+
+        long_audio = b"\x01\x00" * 1600  # 5 chunks
+
+        def run_play():
+            service.play(long_audio, non_blocking=False)
+            t1_finished_event.set()
+
+        t1 = threading.Thread(target=run_play, daemon=True)
+        t1.start()
+
+        self.assertTrue(write_entered_event.wait(timeout=1.0))
+        # Write is now blocked inside write(); trigger stop()
+        service.stop()
+
+        self.assertTrue(t1_finished_event.wait(timeout=1.0), "play() failed to exit after stop().")
+        self.assertFalse(service.is_playing)
+        # Should have written only 1 chunk before cancellation unblocked
+        self.assertEqual(len(blockable_sink.written_chunks), 1)
+
+    def test_no_concurrent_writes_to_same_sink(self):
+        """Verify that multiple interleaved sessions never perform simultaneous writes."""
+        audio_a = b"\x01\x00" * 960  # 3 chunks
+        audio_b = b"\x02\x00" * 960  # 3 chunks
+
+        for _ in range(5):
+            self.service.play(audio_a, non_blocking=True)
+            self.service.play(audio_b, non_blocking=False)
+
+        self.assertEqual(self.sink.max_concurrent_writers, 1)
+
+    def test_no_stale_worker_modifies_active_playback_state(self):
+        """Verify that when a cancelled session terminates, it cannot reset or modify a newer session's state."""
+        hang_event = threading.Event()
+        session1_in_write = threading.Event()
+        session2_in_write = threading.Event()
+        session2_hold_event = threading.Event()
+
+        class StaleDelaySink(MockAudioOutputSink):
+            def write(self, pcm_data):
+                if pcm_data[:2] == b"\x01\x00":
+                    session1_in_write.set()
+                    hang_event.wait(timeout=2.0)
+                elif pcm_data[:2] == b"\x02\x00":
+                    session2_in_write.set()
+                    session2_hold_event.wait(timeout=2.0)
+                super().write(pcm_data)
+
+        sink = StaleDelaySink()
+        service = AudioPlaybackService(sink=sink, config=self.config)
+
+        audio1 = b"\x01\x00" * 320
+        audio2 = b"\x02\x00" * 320
+
+        # Start session 1
+        service.play(audio1, non_blocking=True)
+        self.assertTrue(session1_in_write.wait(timeout=1.0))
+
+        # Abort session 1 via stop_event directly to simulate race
+        session1 = service._current_session
+        session1.stop_event.set()
+
+        # Unblock session 1 write so it reaches finally
+        hang_event.set()
+
+        # Start session 2
+        service.play(audio2, non_blocking=True)
+        session2 = service._current_session
+        # Wait until session 2 has begun writing and is holding inside write
+        self.assertTrue(session2_in_write.wait(timeout=1.0))
+
+        # Wait for session 1's finally block to execute
+        session1.done_event.wait(timeout=1.0)
+
+        # Verify that session 1's termination did NOT wipe session 2
+        self.assertIs(service._current_session, session2)
+        self.assertTrue(service.is_playing)
+
+        # Now let session 2 finish
+        session2_hold_event.set()
+        session2.done_event.wait(timeout=1.0)
+        self.assertFalse(service.is_playing)
+
+        service.shutdown()
+
 
 class TestSoundDeviceBackends(unittest.TestCase):
     """Tests for SoundDeviceInputSource and SoundDeviceOutputSink error handling."""

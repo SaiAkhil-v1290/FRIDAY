@@ -62,7 +62,9 @@ def main() -> None:
                                         print(f"    {line}")
                             # 2. Held for approval
                             elif action_res.requires_approval or action_res.error == "APPROVAL_REQUIRED":
-                                print(f"  ! {action_res.action_name} [APPROVAL REQUIRED - Execution held]")
+                                app_id = (action_res.arguments or {}).get("approval_id", "")
+                                id_info = f" (ID: {app_id} - run 'approve {app_id}' to execute or 'reject {app_id}')" if app_id else ""
+                                print(f"  ! {action_res.action_name} [APPROVAL REQUIRED - Execution held]{id_info}")
                             # 3. Genuinely unimplemented tool
                             elif action_res.error == "EXECUTION_NOT_IMPLEMENTED":
                                 print(f"  - {action_res.action_name}: {action_res.message}")
@@ -78,6 +80,8 @@ def main() -> None:
                     print("\nProposed plan:")
                     for index, action in enumerate(result.plan.actions, start=1):
                         approval = " [APPROVAL REQUIRED]" if action.requires_approval else ""
+                        if action.requires_approval and action.approval_id:
+                            approval += f" (ID: {action.approval_id} - run 'approve {action.approval_id}' or 'reject {action.approval_id}')"
                         print(f"  {index}. {action.tool}{approval}")
                         if action.arguments:
                             for key, value in action.arguments.items():

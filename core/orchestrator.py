@@ -1,5 +1,7 @@
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from security.permissions import approval_manager
 from ai.intent import (
     classify_intent,
     extract_explicit_open_app_target,
@@ -68,6 +70,45 @@ class JarvisOrchestrator:
         self.llm.check_connection()
 
     def handle(self, user_text: str, allow_approved: bool = False) -> AssistantResult:
+        stripped_lower = user_text.strip().lower()
+
+        # Handle explicit approval / rejection commands
+        if stripped_lower.startswith("approve ") or stripped_lower.startswith("reject "):
+            parts = user_text.strip().split(maxsplit=1)
+            cmd = parts[0].lower()
+            target_id = parts[1].strip() if len(parts) > 1 else ""
+
+            if cmd == "approve":
+                ok, msg = approval_manager.approve_request(target_id)
+                if not ok:
+                    plan = TaskPlan(intent="approval_failed", message=msg, actions=[], risk_level="low")
+                    return AssistantResult(message=msg, plan=plan)
+
+                req = approval_manager.get_request(target_id)
+                action = ProposedAction(
+                    tool=req.tool,
+                    arguments=req.arguments,
+                    requires_approval=True,
+                    reason=req.explanation,
+                    approval_id=req.approval_id,
+                )
+                plan = TaskPlan(
+                    intent="approved_action_execution",
+                    message=f"Executing approved action: {req.tool}",
+                    actions=[action],
+                    risk_level=req.risk_level,
+                )
+                exec_res = self.executor.execute_plan(plan)
+                result_msg = msg
+                if exec_res.results and exec_res.results[0].message:
+                    result_msg += f"\n{exec_res.results[0].message}"
+                return AssistantResult(message=result_msg, plan=plan, execution_result=exec_res)
+
+            elif cmd == "reject":
+                ok, msg = approval_manager.reject_request(target_id)
+                plan = TaskPlan(intent="approval_rejected", message=msg, actions=[], risk_level="low")
+                return AssistantResult(message=msg, plan=plan)
+
         intent = classify_intent(user_text)
         cleaned_norm = " ".join(re.sub(r"[^\w\s]", " ", user_text.lower()).split())
 

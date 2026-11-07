@@ -23,7 +23,7 @@ from tools.files import (
 class TestFileDiscovery(unittest.TestCase):
     def setUp(self):
         # Create a controlled sandbox directory structure mimicking safe roots
-        self.test_dir = tempfile.mkdtemp(prefix="jarvis_test_files_")
+        self.test_dir = str(Path(tempfile.mkdtemp(prefix="jarvis_test_files_")).resolve())
         self.mock_desktop = Path(self.test_dir) / "Desktop"
         self.mock_documents = Path(self.test_dir) / "Documents"
         self.mock_downloads = Path(self.test_dir) / "Downloads"

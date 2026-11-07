@@ -2,6 +2,7 @@ import re
 from ai.schemas import TaskPlan, ProposedAction
 from ai.intent import extract_explicit_search_query, extract_explicit_file_search_params
 from tools.registry import TOOL_POLICIES, is_registered_tool
+from security.permissions import approval_manager, ApprovalStatus
 
 # Concepts that must strictly require human approval
 DANGEROUS_ACTION_KEYWORDS = [
@@ -42,6 +43,8 @@ def validate_plan(plan: TaskPlan, current_request: str | None = None) -> TaskPla
     Apply defensive policy checks, safety rules, and consistency filters.
     Never crashes on invalid model output.
     """
+    plan = plan.model_copy(deep=True)
+
     # 1. Clarification handling
     if plan.needs_clarification:
         plan.actions = []
@@ -194,7 +197,26 @@ def validate_plan(plan: TaskPlan, current_request: str | None = None) -> TaskPla
         if policy["requires_approval"] or is_dangerous_request or action.tool in {"delete_files", "send_email", "draft_email"}:
             action.requires_approval = True
         else:
-            action.requires_approval = action.requires_approval or policy["requires_approval"]
+            action.requires_approval = action.requires_approval or bool(policy.get("requires_approval", False))
+
+        if action.requires_approval:
+            needs_new_request = True
+            if action.approval_id:
+                existing_req = approval_manager.get_request(action.approval_id)
+                if existing_req and existing_req.status == ApprovalStatus.PENDING:
+                    needs_new_request = False
+            if needs_new_request:
+                try:
+                    req = approval_manager.create_request(
+                        tool=action.tool,
+                        arguments=action.arguments,
+                        risk_level=str(policy.get("risk_level", "high")),
+                        permission_category=str(policy.get("category", "unclassified")),
+                        explanation=action.reason or f"Approval required to execute {action.tool}",
+                    )
+                    action.approval_id = req.approval_id
+                except Exception:
+                    pass
 
         valid_actions.append(action)
 
@@ -208,22 +230,40 @@ def validate_plan(plan: TaskPlan, current_request: str | None = None) -> TaskPla
                 if f in req_lower:
                     folder_name = f.capitalize()
                     break
+            del_args = {"folder": folder_name, "pattern": "all" if "all" in req_lower else "*"}
+            del_req = approval_manager.create_request(
+                tool="delete_files",
+                arguments=del_args,
+                risk_level="critical",
+                permission_category="destructive",
+                explanation="User requested file deletion; mandatory approval required.",
+            )
             plan.actions = [
                 ProposedAction(
                     tool="delete_files",
-                    arguments={"folder": folder_name, "pattern": "all" if "all" in req_lower else "*"},
+                    arguments=del_args,
                     requires_approval=True,
                     reason="User requested file deletion; mandatory approval required.",
+                    approval_id=del_req.approval_id,
                 )
             ]
             plan.risk_level = "high"
         elif is_legitimate_email:
+            email_args = {"recipient": "recipient", "subject": "Subject", "body": "Body content"}
+            email_req = approval_manager.create_request(
+                tool="send_email",
+                arguments=email_args,
+                risk_level="high",
+                permission_category="communication",
+                explanation="User requested sending an email; mandatory approval required.",
+            )
             plan.actions = [
                 ProposedAction(
                     tool="send_email",
-                    arguments={"recipient": "recipient", "subject": "Subject", "body": "Body content"},
+                    arguments=email_args,
                     requires_approval=True,
                     reason="User requested sending an email; mandatory approval required.",
+                    approval_id=email_req.approval_id,
                 )
             ]
             plan.risk_level = "high"

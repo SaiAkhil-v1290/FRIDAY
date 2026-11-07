@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
-from ai.schemas import TaskPlan, ProposedAction
+from ai.schemas import TaskPlan, ProposedAction, validate_action_arguments
 from tools.registry import is_registered_tool, TOOL_POLICIES
+from security.permissions import approval_manager
+from security.audit import audit_logger
 from tools.application import launch_application, close_application, check_application_running
 from tools.browser import search_browser, get_browser_controller, BrowserActionResult
 from tools.files import (
@@ -103,12 +105,26 @@ class PlanExecutor:
         self,
         action: ProposedAction,
         allow_approved: bool = False,
+        approval_id: str | None = None,
     ) -> ActionExecutionResult:
         tool_name = action.tool
         args = action.arguments or {}
 
+        audit_logger.log(
+            "ACTION_EXECUTION_ATTEMPT",
+            tool_name,
+            "ATTEMPTED",
+            arguments=args,
+        )
+
         # 1. Verify registered in TOOL_POLICIES
         if not is_registered_tool(tool_name):
+            audit_logger.log(
+                "PERMISSION_DENIED",
+                tool_name,
+                "DENIED",
+                reason="Unregistered tool",
+            )
             return ActionExecutionResult(
                 action_name=tool_name,
                 arguments=args,
@@ -120,21 +136,58 @@ class PlanExecutor:
 
         # 2. Check approval requirement
         policy = TOOL_POLICIES.get(tool_name, {})
-        must_require_approval = action.requires_approval or policy.get("requires_approval", False)
+        must_require_approval = action.requires_approval or bool(policy.get("requires_approval", False))
+        target_approval_id = approval_id or getattr(action, "approval_id", None)
 
-        if must_require_approval and not allow_approved:
-            return ActionExecutionResult(
-                action_name=tool_name,
-                arguments=args,
-                executed=False,
-                success=False,
-                message=f"Action '{tool_name}' requires human approval before execution.",
-                error="APPROVAL_REQUIRED",
-                requires_approval=True,
-            )
+        if must_require_approval:
+            if target_approval_id:
+                # Structured approval token provided - validate and atomically consume
+                is_valid, err_msg = approval_manager.validate_and_consume(
+                    target_approval_id, tool_name, args
+                )
+                if not is_valid:
+                    audit_logger.log(
+                        "APPROVAL_VALIDATION_FAILED",
+                        tool_name,
+                        "DENIED",
+                        approval_id=target_approval_id,
+                        error=err_msg,
+                    )
+                    return ActionExecutionResult(
+                        action_name=tool_name,
+                        arguments=args,
+                        executed=False,
+                        success=False,
+                        message=f"Approval validation failed for '{tool_name}': {err_msg}",
+                        error="APPROVAL_INVALID",
+                        requires_approval=True,
+                    )
+            elif not allow_approved:
+                # No valid approval provided and general override not set
+                audit_logger.log(
+                    "APPROVAL_HELD",
+                    tool_name,
+                    "HELD",
+                    reason="Approval required",
+                )
+                return ActionExecutionResult(
+                    action_name=tool_name,
+                    arguments=args,
+                    executed=False,
+                    success=False,
+                    message=f"Action '{tool_name}' requires human approval before execution.",
+                    error="APPROVAL_REQUIRED",
+                    requires_approval=True,
+                )
 
         # 3. Check if execution is implemented for this tool
         if tool_name not in IMPLEMENTED_EXECUTION_TOOLS:
+            audit_logger.log(
+                "EXECUTION_NOT_IMPLEMENTED",
+                tool_name,
+                "SKIPPED",
+                reason="Tool execution not implemented",
+            )
             return ActionExecutionResult(
                 action_name=tool_name,
                 arguments=args,
@@ -145,8 +198,56 @@ class PlanExecutor:
                 requires_approval=must_require_approval,
             )
 
-        # 4. Dispatch to tool implementation
+        # 4. Deterministic argument schema validation
+        is_args_valid, args_err = validate_action_arguments(tool_name, args)
+        if not is_args_valid:
+            audit_logger.log(
+                "ARGUMENTS_VALIDATION_FAILED",
+                tool_name,
+                "REJECTED",
+                error=args_err,
+            )
+            if target_approval_id:
+                approval_manager.mark_failed(target_approval_id, f"Invalid arguments: {args_err}")
+            return ActionExecutionResult(
+                action_name=tool_name,
+                arguments=args,
+                executed=False,
+                success=False,
+                message=f"Invalid arguments for action '{tool_name}': {args_err}",
+                error="INVALID_ARGUMENTS",
+                requires_approval=must_require_approval,
+            )
+
+        # 5. Dispatch to tool implementation
         try:
+            res = self._dispatch_action(tool_name, args)
+        except Exception as exc:
+            res = ActionExecutionResult(
+                action_name=tool_name,
+                arguments=args,
+                executed=True,
+                success=False,
+                message=f"Unexpected error executing '{tool_name}': {exc}",
+                error=str(exc),
+            )
+
+        if target_approval_id:
+            if res.success:
+                approval_manager.mark_completed(target_approval_id)
+            else:
+                approval_manager.mark_failed(target_approval_id, res.message)
+
+        audit_logger.log(
+            "ACTION_EXECUTED",
+            tool_name,
+            "SUCCESS" if res.success else "FAILURE",
+            message=res.message,
+            error=res.error,
+        )
+        return res
+
+    def _dispatch_action(self, tool_name: str, args: dict) -> ActionExecutionResult:
             if tool_name == "open_application":
                 app_name = args.get("application", "")
                 if not app_name:
@@ -486,14 +587,4 @@ class PlanExecutor:
                 success=False,
                 message=f"Execution dispatcher for '{tool_name}' not configured.",
                 error="NO_DISPATCHER",
-            )
-
-        except Exception as exc:
-            return ActionExecutionResult(
-                action_name=tool_name,
-                arguments=args,
-                executed=True,
-                success=False,
-                message=f"Unexpected error executing '{tool_name}': {exc}",
-                error=str(exc),
             )

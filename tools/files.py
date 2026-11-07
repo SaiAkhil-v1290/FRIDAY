@@ -606,91 +606,168 @@ class SearchableUnit:
     line_number: int | None = None
 
 
-def extract_text_file_units(file_path: Path):
-    """Line-by-line generator of SearchableUnits for plain text files."""
+def extract_text_file_units(file_path: Path, max_chars: int = 500_000, max_units: int = 5_000):
+    """Line-by-line generator of SearchableUnits for plain text files with resource bounds."""
+    chars_read = 0
+    units_read = 0
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         for line_idx, line in enumerate(f, start=1):
-            yield SearchableUnit(location=f"Line {line_idx}", text=line, line_number=line_idx)
+            if units_read >= max_units or chars_read >= max_chars:
+                break
+            clean = line
+            chars_read += len(clean)
+            units_read += 1
+            yield SearchableUnit(location=f"Line {line_idx}", text=clean, line_number=line_idx)
 
 
-def extract_pdf_units(file_path: Path):
-    """Page-by-page generator of SearchableUnits for PDF documents using pypdf."""
+def extract_pdf_units(file_path: Path, max_chars: int = 500_000, max_units: int = 5_000, max_pages: int = 200):
+    """Page-by-page generator of SearchableUnits for PDF documents using pypdf with resource bounds."""
     import pypdf
-    with open(file_path, "rb") as f:
-        reader = pypdf.PdfReader(f)
-        for page_idx, page in enumerate(reader.pages, start=1):
-            try:
-                page_text = page.extract_text()
-            except Exception:
-                continue
-            if page_text:
-                for line in page_text.splitlines():
-                    clean = line.strip()
-                    if clean:
-                        yield SearchableUnit(location=f"Page {page_idx}", text=clean)
-
-
-def extract_docx_units(file_path: Path):
-    """Paragraph-by-paragraph generator of SearchableUnits for Word documents."""
-    import docx
-    doc = docx.Document(str(file_path))
-    for p_idx, paragraph in enumerate(doc.paragraphs, start=1):
-        clean = paragraph.text.strip()
-        if clean:
-            yield SearchableUnit(location=f"Paragraph {p_idx}", text=clean)
-    # Also search tables in DOCX
-    for t_idx, table in enumerate(doc.tables, start=1):
-        for r_idx, row in enumerate(table.rows, start=1):
-            for c_idx, cell in enumerate(row.cells, start=1):
-                clean = cell.text.strip()
-                if clean:
-                    yield SearchableUnit(location=f"Table {t_idx}, Row {r_idx}", text=clean)
-
-
-def extract_pptx_units(file_path: Path):
-    """Slide-by-slide generator of SearchableUnits for PowerPoint presentations."""
-    import pptx
-    prs = pptx.Presentation(str(file_path))
-    for s_idx, slide in enumerate(prs.slides, start=1):
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    clean = paragraph.text.strip()
-                    if clean:
-                        yield SearchableUnit(location=f"Slide {s_idx}", text=clean)
-
-
-def extract_xlsx_units(file_path: Path):
-    """Cell-by-cell generator of SearchableUnits for Excel workbooks."""
-    import openpyxl
-    # read_only=True and data_only=True ensure fast, memory-safe, non-executing read
-    wb = openpyxl.load_workbook(str(file_path), read_only=True, data_only=True)
+    chars_read = 0
+    units_read = 0
     try:
-        for sheet_name in wb.sheetnames:
-            sheet = wb[sheet_name]
-            for row in sheet.iter_rows(values_only=False):
-                for cell in row:
-                    if cell.value is not None:
-                        val_str = str(cell.value).strip()
-                        if val_str:
-                            cell_loc = cell.coordinate if hasattr(cell, "coordinate") and cell.coordinate else f"Row {cell.row}, Col {cell.column}"
-                            yield SearchableUnit(location=f'Sheet "{sheet_name}", Cell {cell_loc}', text=val_str)
-    finally:
-        wb.close()
+        with open(file_path, "rb") as f:
+            reader = pypdf.PdfReader(f)
+            if getattr(reader, "is_encrypted", False):
+                return
+            total_pages = len(reader.pages)
+            pages_to_read = min(total_pages, max_pages)
+            for page_idx in range(pages_to_read):
+                if units_read >= max_units or chars_read >= max_chars:
+                    break
+                try:
+                    page = reader.pages[page_idx]
+                    page_text = page.extract_text()
+                except Exception:
+                    continue
+                if page_text:
+                    for line in page_text.splitlines():
+                        if units_read >= max_units or chars_read >= max_chars:
+                            break
+                        clean = line.strip()
+                        if clean:
+                            chars_read += len(clean)
+                            units_read += 1
+                            yield SearchableUnit(location=f"Page {page_idx + 1}", text=clean)
+    except Exception:
+        return
+
+
+def extract_docx_units(file_path: Path, max_chars: int = 500_000, max_units: int = 5_000, max_paragraphs: int = 5_000):
+    """Paragraph-by-paragraph generator of SearchableUnits for Word documents with resource bounds."""
+    import docx
+    chars_read = 0
+    units_read = 0
+    try:
+        doc = docx.Document(str(file_path))
+        for p_idx, paragraph in enumerate(doc.paragraphs, start=1):
+            if units_read >= max_units or chars_read >= max_chars or p_idx > max_paragraphs:
+                break
+            clean = paragraph.text.strip()
+            if clean:
+                chars_read += len(clean)
+                units_read += 1
+                yield SearchableUnit(location=f"Paragraph {p_idx}", text=clean)
+        # Also search tables in DOCX
+        for t_idx, table in enumerate(doc.tables, start=1):
+            if units_read >= max_units or chars_read >= max_chars:
+                break
+            for r_idx, row in enumerate(table.rows, start=1):
+                if units_read >= max_units or chars_read >= max_chars:
+                    break
+                for c_idx, cell in enumerate(row.cells, start=1):
+                    if units_read >= max_units or chars_read >= max_chars:
+                        break
+                    clean = cell.text.strip()
+                    if clean:
+                        chars_read += len(clean)
+                        units_read += 1
+                        yield SearchableUnit(location=f"Table {t_idx}, Row {r_idx}", text=clean)
+    except Exception:
+        return
+
+
+def extract_pptx_units(file_path: Path, max_chars: int = 500_000, max_units: int = 5_000, max_slides: int = 200):
+    """Slide-by-slide generator of SearchableUnits for PowerPoint presentations with resource bounds."""
+    import pptx
+    chars_read = 0
+    units_read = 0
+    try:
+        prs = pptx.Presentation(str(file_path))
+        for s_idx, slide in enumerate(prs.slides, start=1):
+            if units_read >= max_units or chars_read >= max_chars or s_idx > max_slides:
+                break
+            for shape in slide.shapes:
+                if units_read >= max_units or chars_read >= max_chars:
+                    break
+                if shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
+                        if units_read >= max_units or chars_read >= max_chars:
+                            break
+                        clean = paragraph.text.strip()
+                        if clean:
+                            chars_read += len(clean)
+                            units_read += 1
+                            yield SearchableUnit(location=f"Slide {s_idx}", text=clean)
+    except Exception:
+        return
+
+
+def extract_xlsx_units(file_path: Path, max_chars: int = 500_000, max_units: int = 5_000, max_rows: int = 5_000):
+    """Cell-by-cell generator of SearchableUnits for Excel workbooks with resource bounds."""
+    import openpyxl
+    chars_read = 0
+    units_read = 0
+    try:
+        # read_only=True and data_only=True ensure fast, memory-safe, non-executing read
+        wb = openpyxl.load_workbook(str(file_path), read_only=True, data_only=True)
+        try:
+            for sheet_name in wb.sheetnames:
+                if units_read >= max_units or chars_read >= max_chars:
+                    break
+                sheet = wb[sheet_name]
+                for r_idx, row in enumerate(sheet.iter_rows(values_only=False), start=1):
+                    if units_read >= max_units or chars_read >= max_chars or r_idx > max_rows:
+                        break
+                    for cell in row:
+                        if units_read >= max_units or chars_read >= max_chars:
+                            break
+                        if cell.value is not None:
+                            val_str = str(cell.value).strip()
+                            if val_str:
+                                chars_read += len(val_str)
+                                units_read += 1
+                                cell_loc = cell.coordinate if hasattr(cell, "coordinate") and cell.coordinate else f"Row {cell.row}, Col {cell.column}"
+                                yield SearchableUnit(location=f'Sheet "{sheet_name}", Cell {cell_loc}', text=val_str)
+        finally:
+            wb.close()
+    except Exception:
+        return
 
 
 def extract_searchable_units(file_path: Path, file_ext: str):
-    """Dispatch file extraction based on extension."""
+    """Dispatch file extraction based on extension with bounded resource limits."""
+    from config import settings
+    try:
+        max_file_size = getattr(settings, "max_document_size_bytes", 10 * 1024 * 1024)
+        if file_path.stat().st_size > max_file_size:
+            return ()
+    except (OSError, PermissionError):
+        return ()
+
+    max_chars = getattr(settings, "max_extracted_chars_per_doc", 500_000)
+    max_units = getattr(settings, "max_extraction_units_per_doc", 5_000)
+
     if file_ext in TEXT_CONTENT_EXTENSIONS:
-        return extract_text_file_units(file_path)
+        return extract_text_file_units(file_path, max_chars=max_chars, max_units=max_units)
     elif file_ext == ".pdf":
-        return extract_pdf_units(file_path)
+        return extract_pdf_units(file_path, max_chars=max_chars, max_units=max_units)
     elif file_ext == ".docx":
-        return extract_docx_units(file_path)
+        return extract_docx_units(file_path, max_chars=max_chars, max_units=max_units)
     elif file_ext == ".pptx":
-        return extract_pptx_units(file_path)
+        return extract_pptx_units(file_path, max_chars=max_chars, max_units=max_units)
     elif file_ext == ".xlsx":
-        return extract_xlsx_units(file_path)
+        return extract_xlsx_units(file_path, max_chars=max_chars, max_units=max_units)
     return ()
 
 
@@ -950,6 +1027,33 @@ def open_local_file(file_path_str: str) -> FileOpenResult:
             error="ACCESS_DENIED",
         )
 
+    # Re-validate immediately before launching to mitigate TOCTOU / symlink swapping
+    try:
+        final_target = candidate.resolve()
+        is_still_safe = False
+        for root in SAFE_SEARCH_ROOTS.values():
+            try:
+                final_target.relative_to(root.resolve())
+                is_still_safe = True
+                break
+            except (ValueError, RuntimeError):
+                continue
+        if not is_still_safe or not final_target.is_file():
+            return FileOpenResult(
+                success=False,
+                message="File access revalidation failed immediately prior to launch.",
+                path=str(final_target),
+                error="UNSAFE_LOCATION",
+            )
+        resolved_candidate = final_target
+    except Exception as reval_exc:
+        return FileOpenResult(
+            success=False,
+            message=f"Revalidation error: {reval_exc}",
+            path=str(resolved_candidate),
+            error="ACCESS_DENIED",
+        )
+
     # Launch file via OS default viewer without shell=True
     try:
         if hasattr(os, "startfile"):
@@ -1047,6 +1151,33 @@ def reveal_local_file(file_path: str) -> FileRevealResult:
         return FileRevealResult(
             success=False,
             message=f"Access denied to file: '{resolved_candidate.name}'.",
+            path=str(resolved_candidate),
+            error="ACCESS_DENIED",
+        )
+
+    # Re-validate immediately before launching to mitigate TOCTOU / symlink swapping
+    try:
+        final_target = candidate_path.resolve()
+        is_still_safe = False
+        for root in SAFE_SEARCH_ROOTS.values():
+            try:
+                final_target.relative_to(root.resolve())
+                is_still_safe = True
+                break
+            except (ValueError, RuntimeError):
+                continue
+        if not is_still_safe or not final_target.is_file():
+            return FileRevealResult(
+                success=False,
+                message="File reveal revalidation failed immediately prior to launch.",
+                path=str(final_target),
+                error="UNSAFE_LOCATION",
+            )
+        resolved_candidate = final_target
+    except Exception as reval_exc:
+        return FileRevealResult(
+            success=False,
+            message=f"Revalidation error: {reval_exc}",
             path=str(resolved_candidate),
             error="ACCESS_DENIED",
         )
@@ -1177,6 +1308,36 @@ def open_local_folder(folder_target: str) -> FolderOpenResult:
         return FolderOpenResult(
             success=False,
             message=f"Access denied to folder: '{resolved_candidate.name}'.",
+            folder=raw_target,
+            path=str(resolved_candidate),
+            error="ACCESS_DENIED",
+        )
+
+    # Re-validate immediately before launching to mitigate TOCTOU / symlink swapping
+    try:
+        final_target = target_dir.resolve()
+        is_still_safe = False
+        for safe_root in SAFE_SEARCH_ROOTS.values():
+            try:
+                resolved_root = safe_root.resolve()
+                if final_target == resolved_root or resolved_root in final_target.parents:
+                    is_still_safe = True
+                    break
+            except Exception:
+                continue
+        if not is_still_safe or not final_target.is_dir():
+            return FolderOpenResult(
+                success=False,
+                message="Folder revalidation failed immediately prior to launch.",
+                folder=raw_target,
+                path=str(final_target),
+                error="UNSAFE_LOCATION",
+            )
+        resolved_candidate = final_target
+    except Exception as reval_exc:
+        return FolderOpenResult(
+            success=False,
+            message=f"Folder revalidation error: {reval_exc}",
             folder=raw_target,
             path=str(resolved_candidate),
             error="ACCESS_DENIED",

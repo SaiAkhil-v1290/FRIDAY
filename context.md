@@ -328,6 +328,35 @@ LONG-TERM MEMORY (Local SQLite)
 - **`core/orchestrator.py`**: Integrated `MemoryGrounder` alongside `MemoryRetriever`.
 - **`tests/test_memory_grounding.py`**: Added unit tests covering known fact grounding, missing fact uncertainty detection, suggestion vs. fact separation, status hallucination prevention, and regressions.
 
+- **Milestone 5.1.1 & 5.1.1.2**: Local Audio I/O, Voice Activity Detection Foundation & Audio Lifecycle Hardening:
+  - **Git Branch Isolation**: Phase 5 work is strictly isolated on branch `akhil/phase-5-voice` branching from `origin/main`. Preserves `akhil/phase-3-computer-control` intact and unmerged without carryover of unrelated Phase 3 changes.
+  - **Dedicated Voice Package (`voice/`)**:
+    - `voice/config.py`: Centralized audio configuration (`VoiceConfig`) with strict validation for sample rates (8k, 16k, 32k, 48k), mono channels, 16-bit PCM, frame durations (10, 20, 30 ms), VAD aggressiveness mode (0-3), silence timeout (`vad_silence_duration_ms`), minimum speech duration (`vad_min_speech_duration_ms`), configurable energy thresholds (`silence_rms_threshold`, `speech_rms_threshold`), maximum pre-speech buffer duration (`max_pre_speech_duration_ms`), and bounded total utterance limits (`max_buffer_duration_sec`).
+    - `voice/audio_io.py`:
+      - `AudioInputSource` & `AudioOutputSink`: Decoupled abstract interfaces for audio I/O with concrete `SoundDeviceInputSource` and `SoundDeviceOutputSink` backends wrapping `sounddevice`.
+      - `SoundDeviceOutputSink`: Hardened `stop()` to immediately abort and close streams, releasing resources and resetting `_stream = None` so subsequent playback cleanly reopens fresh hardware streams.
+      - `AudioPlaybackService`:
+        - Non-blocking asynchronous playback with immediate thread-safe cancellation (`stop()`, barge-in support).
+        - Deadlock-free blocking playback: releases `_playback_lock` during blocking write iterations while keeping thread-safe stop event signaling.
+        - Worker overlap protection: joins terminating workers with timeout and strictly rejects starting overlapping playback workers if an unresponsive worker fails to exit.
+        - Fresh stream reuse: supports immediate successive playback calls after cancellation.
+      - `AudioCaptureService`:
+        - Dedicated background capture worker with volatile bounded queue (`max_queue_size`).
+        - Hardened shutdown sequence: marks stop event, explicitly closes hardware input source first to unblock blocking PortAudio driver reads, and joins worker thread safely without abandoned threads.
+        - Safe startup: rejects starting if an alive worker from a previous session is still terminating, while remaining idempotent if already running.
+    - `voice/vad.py`:
+      - `VoiceActivityDetector`: State machine for speech onset and speech termination detection using `webrtcvad` with deterministic RMS energy thresholding fallback.
+      - Bounded pre-speech buffer: caps pre-speech onset frames to `max_pre_speech_bytes` (`max_pre_speech_duration_ms`).
+      - Bounded utterance buffer: enforces `max_buffer_bytes` (`max_buffer_duration_sec`), preventing unbounded RAM usage during sustained background noise.
+      - Explicit truncation reporting: sets `is_truncated = True`, emits `buffer_overflow` events immediately upon exceeding buffer capacity, tags frame events with `truncated=True`, and preserves truncation status in the final `speech_end` event payload.
+      - Configurable energy thresholds: uses `silence_rms_threshold` (default 150.0) and `speech_rms_threshold` (default 450.0).
+      - Clean state reset: `reset()` clears speech buffers, pre-speech buffers, frame counters, and truncation flags.
+  - **Testing & Verification**:
+    - `tests/test_voice_audio_io.py`: 28 unit and integration tests covering capture lifecycle, playback, cancellation, blocking playback interruption without deadlock, reuse after cancellation, worker overlap prevention, unblocking capture shutdown, buffer overflows, and missing device handling.
+    - `tests/test_voice_vad.py`: 13 unit and integration tests covering speech detection, silence accumulation, speech start/end events, frame validation, pre-speech buffer bounding, utterance overflow events, truncation reporting, and state resets.
+    - 100% headless mock testing without physical microphone or speaker hardware dependencies.
+    - Total test suite: 308 tests passing across the entire project.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

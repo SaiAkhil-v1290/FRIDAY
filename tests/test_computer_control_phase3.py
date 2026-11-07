@@ -24,6 +24,10 @@ from ai.schemas import TaskPlan, ProposedAction
 
 
 class TestComputerControlPhase3(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls):
+        get_browser_controller().reset_session()
+
     def setUp(self):
         self.desktop_ctrl = get_desktop_controller()
         self.browser_ctrl = get_browser_controller()
@@ -365,5 +369,100 @@ class TestComputerControlPhase3(unittest.TestCase):
         res_closed_content = self.browser_ctrl.get_page_content()
         self.assertFalse(res_closed_content.success)
         self.assertEqual(res_closed_content.error, "NO_ACTIVE_SESSION")
+
+    # -------------------------------------------------------------
+    # 6. Real Browser Failure & Lifecycle Edge Cases (Phase 3.3)
+    # -------------------------------------------------------------
+
+    def test_playwright_unavailable_failure(self):
+        # Use an isolated controller instance to avoid affecting singleton test runner session
+        from tools.browser import BrowserController
+        isolated_ctrl = BrowserController()
+        with patch("builtins.__import__", side_effect=ImportError("No module named 'playwright'")):
+            ready, err = isolated_ctrl._ensure_browser()
+            self.assertFalse(ready)
+            self.assertIn("Playwright is not installed", err)
+
+            res = isolated_ctrl.open_website("https://example.com")
+            self.assertFalse(res.success)
+            self.assertEqual(res.error, "BROWSER_UNAVAILABLE")
+
+    def test_chromium_launch_failure(self):
+        # Use an isolated controller instance with mocked driver launch
+        from tools.browser import BrowserController
+        isolated_ctrl = BrowserController()
+        mock_driver = MagicMock()
+        mock_driver.chromium.launch.side_effect = Exception("Executable doesn't exist at C:\\Chromium")
+        isolated_ctrl._playwright = mock_driver
+
+        ready, err = isolated_ctrl._ensure_browser()
+        self.assertFalse(ready)
+        self.assertIn("Failed to launch controlled Playwright Chromium browser", err)
+
+        res = isolated_ctrl.open_website("https://example.com")
+        self.assertFalse(res.success)
+        self.assertEqual(res.error, "BROWSER_UNAVAILABLE")
+
+    def test_page_closed_externally(self):
+        test_html = "data:text/html,%3Ch1%3EExternal%20Close%3C/h1%3E"
+        res_open = self.browser_ctrl.open_website(test_html)
+        self.assertTrue(res_open.success)
+        self.assertTrue(self.browser_ctrl.is_active)
+
+        # Simulate page closed externally by user or crash
+        self.browser_ctrl._page.close()
+        self.assertFalse(self.browser_ctrl.is_active)
+
+        # All operations cleanly return NO_ACTIVE_SESSION
+        self.assertEqual(self.browser_ctrl.get_current_url().error, "NO_ACTIVE_SESSION")
+        self.assertEqual(self.browser_ctrl.get_page_title().error, "NO_ACTIVE_SESSION")
+        self.assertEqual(self.browser_ctrl.get_page_content().error, "NO_ACTIVE_SESSION")
+        self.assertEqual(self.browser_ctrl.get_visible_links().error, "NO_ACTIVE_SESSION")
+        self.assertEqual(self.browser_ctrl.go_back().error, "NO_ACTIVE_SESSION")
+        self.assertEqual(self.browser_ctrl.go_forward().error, "NO_ACTIVE_SESSION")
+        self.assertEqual(self.browser_ctrl.refresh().error, "NO_ACTIVE_SESSION")
+
+    def test_navigation_timeout_and_no_system_browser_fallback(self):
+        self.browser_ctrl.reset_session()
+        self.browser_ctrl._ensure_browser()
+
+        # Mock goto to raise TimeoutError
+        with patch.object(self.browser_ctrl._page, "goto", side_effect=Exception("Navigation timeout of 15000ms exceeded")):
+            with patch("webbrowser.open") as mock_web_open:
+                res = self.browser_ctrl.open_website("https://example.com")
+                self.assertFalse(res.success)
+                self.assertIn("Navigation timeout", res.error)
+                # Verify absolutely NO fallback to system webbrowser
+                mock_web_open.assert_not_called()
+
+    # -------------------------------------------------------------
+    # 7. Permission Policy Bypass Prevention & Physical Interactions
+    # -------------------------------------------------------------
+
+    def test_permission_bypass_prevention(self):
+        from security.permissions import requires_approval
+        executor = PlanExecutor()
+
+        # Consequential actions that must require approval:
+        consequential_tools = ["click_mouse", "type_text", "press_key", "hotkey", "delete_files"]
+        for tool in consequential_tools:
+            self.assertTrue(requires_approval(tool), f"Expected {tool} to require approval")
+
+            # Verify that ProposedAction(requires_approval=False) CANNOT bypass policy
+            action = ProposedAction(
+                tool=tool,
+                arguments={"x": 100, "y": 100} if "mouse" in tool else ({"text": "a"} if tool == "type_text" else ({"key": "a"} if tool == "press_key" else ({"keys": ["a"]} if tool == "hotkey" else {"folder": "Downloads"}))),
+                requires_approval=False,
+                reason="attempt bypass",
+            )
+            res = executor.execute_action(action, allow_approved=False)
+            self.assertFalse(res.executed)
+            self.assertEqual(res.error, "APPROVAL_REQUIRED")
+            self.assertTrue(res.requires_approval)
+
+        # Physical desktop interactions that do not cause consequential state changes:
+        non_consequential_tools = ["move_mouse", "scroll_mouse", "capture_screen", "describe_screen"]
+        for tool in non_consequential_tools:
+            self.assertFalse(requires_approval(tool), f"Expected {tool} to NOT require approval")
 
 

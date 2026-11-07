@@ -357,13 +357,14 @@ LONG-TERM MEMORY (Local SQLite)
 - **`core/orchestrator.py`**: Integrated `MemoryGrounder` alongside `MemoryRetriever`.
 - **`tests/test_memory_grounding.py`**: Added unit tests covering known fact grounding, missing fact uncertainty detection, suggestion vs. fact separation, status hallucination prevention, and regressions.
 
-- **Milestone 5.1 & Phase 3 / 3.1 / 3.2: Real Computer Control, Browser Automation & Hardened Desktop Interaction**:
+- **Milestone 5.1 & Phase 3 / 3.1 / 3.2 / 3.3: Real Computer Control, Browser Automation & Hardened Desktop Interaction**:
   - **Single Source of Truth Browser Automation (`tools/browser.py`)**:
     - **Playwright Single Source of Truth**: Controlled Playwright Chromium is the *sole* browser automation engine for all browser-control tools (`open_website`, `go_back`, `go_forward`, `refresh`, `get_current_page_info`, `get_page_title`, `get_current_url`, `get_page_content`, `get_visible_links`). Added `playwright>=1.40.0` to `requirements.txt`.
     - **Setup Instructions**: Requires `pip install playwright` followed by `python -m playwright install chromium`.
     - **No Simulated Fallbacks**: Completely eliminated `urllib.request` and `BeautifulSoup` fallback extraction, duplicate `webbrowser.open()` calls, and internal simulated history lists.
     - **Verified Browser State**: All actions directly operate against the real browser page DOM. Back/forward use actual browser session navigation (`self._page.go_back()` / `self._page.go_forward()`). Refresh invokes `self._page.reload()`. Visible links and content are scraped directly from the active live DOM.
-    - **Truthful Error Reporting**: When Playwright or Chromium is unavailable or closed, functions immediately return explicit failures (`BROWSER_UNAVAILABLE`, `NO_ACTIVE_SESSION`) without fabricating state or reporting false successes.
+    - **Truthful Error Reporting & HTTP Status Checks**: When Playwright or Chromium is unavailable or closed, functions immediately return explicit failures (`BROWSER_UNAVAILABLE`, `NO_ACTIVE_SESSION`). `open_website` checks HTTP response status codes: HTTP 4xx/5xx responses return `success=False` with status code tracking (`HTTP_404`, `HTTP_500`).
+    - **Rigorous DOM Link Visibility Detection**: `get_visible_links()` inspects DOM styling and layout dimensions: excludes elements with `display: none`, `visibility: hidden`, `visibility: collapse`, zero layout bounding dimensions (`rect.width <= 0 || rect.height <= 0`), hidden parent elements up the DOM tree, or whitespace-only text. Preserves maximum limit of 10 visible links with resolved absolute `href`.
   - **Hardened Desktop Control & Input Safety (`tools/desktop.py`)**:
     - OS compatibility enforcement: strictly validates `sys.platform == "win32"` and returns clean `UNSUPPORTED_PLATFORM` errors on non-Windows environments without claiming no-op success.
     - Bounded coordinate checking: coordinates for `move_mouse` and `click_mouse` are strictly bounded by primary display dimensions from `GetSystemMetrics(0)` and `GetSystemMetrics(1)`.
@@ -376,14 +377,17 @@ LONG-TERM MEMORY (Local SQLite)
   - **Visual Awareness & Screen Understanding (Truthful Reporting)**:
     - Clearly distinguishes raw screenshot capture (`capture_screen`) from semantic visual analysis (`describe_screen`).
     - `describe_screen` accurately reports display dimensions, resolution, and orientation, and explicitly states that semantic visual interpretation (OCR/UI element understanding) is *not yet implemented* locally. Zero cloud vision API dependencies are introduced.
-  - **Tool Policy & Permission Gating (`tools/registry.py` & `security/permissions.py`)**:
-    - Consequential desktop actions (`click_mouse`, `type_text`, `press_key`, `hotkey`) are explicitly configured with `requires_approval: True` in `TOOL_POLICIES`.
-    - Read-only actions (`move_mouse`, `scroll_mouse`, `capture_screen`, `describe_screen`, `browser_get_page_info`, `browser_get_page_content`, `browser_get_visible_links`) remain unblocked (`requires_approval: False`).
+  - **Tool Policy & Permission Gating (`tools/registry.py`, `security/permissions.py`, `core/executor.py`)**:
+    - Centralized permission lookup: `core/executor.py` explicitly uses `security.permissions.requires_approval(tool_name)` as the canonical lookup.
+    - Approval bypass prevention: actions with `action.requires_approval=False` cannot bypass `security.permissions.requires_approval(tool_name)`.
+    - Consequential desktop actions (`click_mouse`, `type_text`, `press_key`, `hotkey`, `delete_files`) are explicitly configured with `requires_approval: True` in `TOOL_POLICIES`.
+    - Physical desktop interactions (`move_mouse`, `scroll_mouse`) and inspection actions (`capture_screen`, `describe_screen`, `browser_get_page_info`, `browser_get_page_content`, `browser_get_visible_links`) are documented and configured as non-consequential (`requires_approval: False`).
     - `ActionExecutionResult` in `core/executor.py` records both `executed` and `verified` state flags.
-  - **Comprehensive Mock Isolation & Integration Testing (`tests/test_computer_control_phase3.py` & `tests/test_browser_automation.py`)**:
+  - **In-Process Local Test Server & Comprehensive Test Isolation (`tests/test_browser_automation.py` & `tests/test_computer_control_phase3.py`)**:
+    - Zero external internet dependency: replaced all external navigations (Google, GitHub, YouTube) in browser tests with an in-process local HTTP server (`MockHTTPHandler` on `127.0.0.1:<random_port>`).
     - Fully mocked all Windows API input dispatches (`mouse_event`, `SetCursorPos`, `keybd_event`, `VkKeyScanW`, `ImageGrab.grab`) in unit tests so executing tests never controls physical mouse or keyboard.
-    - Real Playwright browser integration tests using local data/HTML URLs testing full lifecycle: initialization, page navigation, DOM inspection, back/forward/refresh, closed-page error handling, and resource teardown.
-    - Full project regression test suite passes cleanly across all 286 tests.
+    - Focused failure case testing: covers Playwright package unavailable, Chromium launch failure, page closed externally, session reset, navigation timeouts, inspection after closure, no fallback to system browser, and HTTP 4xx/5xx handling.
+    - Full project regression test suite passes cleanly across all 291 tests.
 
 ## Execution & Setup
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`

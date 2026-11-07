@@ -165,6 +165,18 @@ class BrowserController:
             real_title = self._page.title() or self._derive_page_title(real_url)
             self._active = True
 
+            # If navigation response is present, check HTTP status
+            if response is not None:
+                status = response.status
+                if status >= 400:
+                    return BrowserActionResult(
+                        success=False,
+                        message=f"HTTP {status} error when loading {real_url}.",
+                        url=real_url,
+                        title=real_title,
+                        error=f"HTTP_{status}",
+                    )
+
             site_name = self._derive_site_name(real_url)
             return BrowserActionResult(
                 success=True,
@@ -406,10 +418,32 @@ class BrowserController:
         try:
             raw_links = self._page.eval_on_selector_all(
                 "a[href]",
-                """elements => elements.map(e => ({
-                    text: (e.innerText || e.textContent || '').trim(),
-                    href: e.href
-                })).filter(item => item.text && !item.href.startsWith('javascript:') && !item.href.startsWith('#')).slice(0, 10)"""
+                """elements => elements.map(e => {
+                    const text = (e.innerText || e.textContent || '').trim();
+                    const href = e.href;
+                    if (!text || !href || href.startsWith('javascript:') || href.startsWith('#')) {
+                        return null;
+                    }
+                    // Establishing genuine visibility:
+                    const rect = e.getBoundingClientRect();
+                    const style = window.getComputedStyle(e);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
+                        return null;
+                    }
+                    if (rect.width <= 0 || rect.height <= 0) {
+                        return null;
+                    }
+                    // Check parent visibility
+                    let parent = e.parentElement;
+                    while (parent) {
+                        const pStyle = window.getComputedStyle(parent);
+                        if (pStyle.display === 'none' || pStyle.visibility === 'hidden' || pStyle.visibility === 'collapse') {
+                            return null;
+                        }
+                        parent = parent.parentElement;
+                    }
+                    return { text, href };
+                }).filter(Boolean).slice(0, 10)"""
             )
             links = [(item["text"], item["href"]) for item in (raw_links or [])]
             cur_title = self._page.title() or self._derive_page_title(self._page.url)
@@ -451,16 +485,20 @@ class BrowserController:
             except Exception:
                 pass
             self._browser = None
+
+    def reset(self) -> None:
+        """Alias for reset_session to support test teardown and cleanup."""
+        self.reset_session()
+
+    def shutdown(self) -> None:
+        """Completely shut down the Playwright process and release all driver resources."""
+        self.reset_session()
         if self._playwright is not None:
             try:
                 self._playwright.stop()
             except Exception:
                 pass
             self._playwright = None
-
-    def reset(self) -> None:
-        """Alias for reset_session to support test teardown and cleanup."""
-        self.reset_session()
 
     def _derive_site_name(self, url: str) -> str:
         """Derive readable site name from URL or alias."""

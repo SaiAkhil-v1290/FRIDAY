@@ -2,6 +2,8 @@
 # in Milestone 1. Policies are enforced by the orchestrator/planner.
 TOOL_POLICIES: dict[str, dict[str, bool]] = {
     "open_application": {"requires_approval": False},
+    # close_application is an application lifecycle tool governed by the Milestone 4
+    # allowlist and protected application policy (e.g. closable: False for system apps).
     "close_application": {"requires_approval": False},
     "check_application_running": {"requires_approval": False},
     "browser_search": {"requires_approval": False},
@@ -15,6 +17,8 @@ TOOL_POLICIES: dict[str, dict[str, bool]] = {
     "read_screen": {"requires_approval": False},
     "capture_screen": {"requires_approval": False},
     "describe_screen": {"requires_approval": False},
+    # move_mouse and scroll_mouse are physical desktop interactions that do not trigger
+    # consequential state changes on their own (unlike clicks, keystrokes, or deletions).
     "move_mouse": {"requires_approval": False},
     "click_mouse": {"requires_approval": True},
     "scroll_mouse": {"requires_approval": False},

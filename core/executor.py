@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from ai.schemas import TaskPlan, ProposedAction
 from tools.registry import is_registered_tool, TOOL_POLICIES
+from security.permissions import requires_approval
 from tools.application import launch_application, close_application, check_application_running
 from tools.browser import search_browser, get_browser_controller, BrowserActionResult
 from tools.desktop import get_desktop_controller, DesktopActionResult
@@ -131,9 +132,9 @@ class PlanExecutor:
                 error="UNREGISTERED_TOOL",
             )
 
-        # 2. Check approval requirement
-        policy = TOOL_POLICIES.get(tool_name, {})
-        must_require_approval = action.requires_approval or policy.get("requires_approval", False)
+        # 2. Check approval requirement via security.permissions policy lookup
+        policy_approval = requires_approval(tool_name)
+        must_require_approval = action.requires_approval or policy_approval
 
         if must_require_approval and not allow_approved:
             return ActionExecutionResult(

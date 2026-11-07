@@ -389,6 +389,40 @@ LONG-TERM MEMORY (Local SQLite)
     - Focused failure case testing: covers Playwright package unavailable, Chromium launch failure, page closed externally, session reset, navigation timeouts, inspection after closure, no fallback to system browser, and HTTP 4xx/5xx handling.
     - Full project regression test suite passes cleanly across all 291 tests.
 
+- **Milestone 5.1.1: Local Audio I/O and Voice Activity Detection Foundation**:
+  - **Dedicated Voice Subsystem (`voice/`)**:
+    - Architected as an isolated, modular package completely decoupled from `JarvisOrchestrator` and `PlanExecutor`.
+    - **Voice Configuration (`voice/config.py`)**: Strict mathematical bounds (`sample_rate=16000`, `channels=1`, `sample_width=2`, `frame_duration_ms=20`, `vad_mode=2`, `vad_silence_duration_ms=800`, `vad_min_speech_duration_ms=100`, `max_buffer_duration_sec=30.0`, `max_queue_size=1000`).
+  - **Audio Input Architecture (`AudioCaptureService` in `voice/audio_io.py`)**:
+    - Protocol-based design around `AudioInputSource` abstract base class with default `SoundDeviceInputSource` backend using `sounddevice.RawInputStream`.
+    - Captures 16-bit linear PCM mono frames at 16 kHz without writing recordings to disk.
+    - Controlled daemon worker thread feeding a bounded queue (`queue.Queue(maxsize=1000)`). If full, oldest frames are dropped and tracked via `overflow_count` to prevent unbounded memory growth.
+    - Gracefully handles missing microphone devices (`AudioDeviceError`) and runtime device disconnection via `on_error` callbacks without crashing.
+    - Clean, deterministic, idempotent start/stop lifecycle with thread synchronization locks preventing duplicate worker threads.
+  - **Audio Output Architecture (`AudioPlaybackService` in `voice/audio_io.py`)**:
+    - Protocol-based design around `AudioOutputSink` abstract base class with default `SoundDeviceOutputSink` backend using `sounddevice.RawOutputStream`.
+    - Plays raw 16-bit linear PCM mono audio with support for both non-blocking (background worker) and blocking playback modes.
+    - Immediate cancellation and barge-in support: `stop()` and `abort()` immediately signal stop events and abort the active stream within < 10ms.
+    - Strict overlap prevention: starting new playback automatically aborts any currently active playback session before starting.
+    - Graceful error handling for missing audio output devices or stream write failures without crashing.
+  - **Voice Activity Detection (`VoiceActivityDetector` in `voice/vad.py`)**:
+    - Primary acoustic detection via `webrtcvad.Vad(mode=2)` operating on 20ms frames at 16 kHz.
+    - Fast baseline energy/RMS silence floor filter (< 150.0 RMS) prevents statistical GMM hangover delays on pure silence frames.
+    - Stateful speech tracking with speech-start detection triggered only after continuous speech reaches `vad_min_speech_duration_ms` (100ms) to filter clicks/pops.
+    - End-of-speech silence threshold tracking: emits `speech_end` event after `vad_silence_duration_ms` (800ms) of continuous silence.
+    - Pre-speech onset buffering: retains onset audio frames in `_pre_speech_buffer` so word onsets and initial syllables are never clipped when speech start is confirmed.
+    - Returns full accumulated utterance audio on `speech_end` event.
+    - Rejects empty, corrupted, or misaligned frames via `InvalidFrameError`.
+  - **Buffer Retention & Privacy Safety**:
+    - Audio is retained purely in volatile memory (`bytearray` and bounded queues). Zero persistent disk writes.
+    - Enforces maximum buffer limits (`max_buffer_bytes = 960,000` bytes for 30s) to prevent memory leaks during extended operation.
+    - Explicit `clear_buffer()` and `reset()` release all buffered frames on session termination.
+  - **Automated Test Isolation (`tests/test_voice_audio_io.py` & `tests/test_voice_vad.py`)**:
+    - 33 comprehensive unit and integration tests using `MockAudioInputSource` and `MockAudioOutputSink`.
+    - 100% headless testing with zero physical microphone or speaker hardware dependencies.
+    - Covers capture lifecycle, missing devices, disconnection, bounded queue overflow, playback cancellation, duplicate overlap prevention, speech/silence detection, speech start/end events, invalid frame handling, and idempotent shutdown.
+    - Full project test suite passes cleanly across all 324 tests.
+
 ## Execution & Setup
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Install dependencies: `pip install -r requirements.txt`

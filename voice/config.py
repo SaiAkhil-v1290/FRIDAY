@@ -8,7 +8,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class VoiceConfig:
     """
-    Configuration parameters for audio capture, playback, and voice activity detection.
+    Configuration parameters for audio capture, playback, voice activity detection,
+    and speech-to-text (STT) transcription.
     Enforces strict mathematical bounds to guarantee frame alignment and memory safety.
     """
     sample_rate: int = 16000
@@ -23,6 +24,13 @@ class VoiceConfig:
     speech_rms_threshold: float = 450.0  # Energy fallback threshold for speech when WebRTC VAD unavailable
     max_buffer_duration_sec: float = 30.0  # Volatile audio retention bound
     max_queue_size: int = 1000  # Bounded queue capacity to prevent memory bloat
+    whisper_executable_path: str | None = None
+    whisper_model_path: str | None = None
+    whisper_language: str = "auto"
+    stt_timeout_seconds: float = 30.0
+    max_audio_duration_seconds: float = 60.0
+    stt_threads: int = 4
+    stt_output_format: str = "txt"
 
     def __post_init__(self) -> None:
         if self.sample_rate not in (8000, 16000, 32000, 48000):
@@ -55,6 +63,16 @@ class VoiceConfig:
             raise ValueError("max_buffer_duration_sec must be positive.")
         if self.max_queue_size <= 0:
             raise ValueError("max_queue_size must be positive.")
+        if not self.whisper_language or not self.whisper_language.strip():
+            raise ValueError("whisper_language cannot be empty.")
+        if self.stt_timeout_seconds <= 0:
+            raise ValueError("stt_timeout_seconds must be positive.")
+        if self.max_audio_duration_seconds <= 0:
+            raise ValueError("max_audio_duration_seconds must be positive.")
+        if self.stt_threads <= 0:
+            raise ValueError("stt_threads must be positive.")
+        if self.stt_output_format not in ("txt", "json", "stdout"):
+            raise ValueError(f"Unsupported stt_output_format='{self.stt_output_format}'. Must be 'txt', 'json', or 'stdout'.")
 
     @property
     def bytes_per_sample(self) -> int:
@@ -75,6 +93,10 @@ class VoiceConfig:
     @property
     def max_buffer_bytes(self) -> int:
         return int(self.sample_rate * self.max_buffer_duration_sec * self.bytes_per_sample)
+
+    @property
+    def max_audio_bytes(self) -> int:
+        return int(self.sample_rate * self.max_audio_duration_seconds * self.bytes_per_sample)
 
 
 default_voice_config = VoiceConfig()

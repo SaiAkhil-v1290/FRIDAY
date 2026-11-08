@@ -392,6 +392,52 @@ LONG-TERM MEMORY (Local SQLite)
     - Total voice tests: 52 passed in 15.25s.
     - Total project test suite: 319 passed in 69.63s with zero regressions.
 
+- **Milestone 5.1.2**: Local Speech-to-Text (STT) using Whisper.cpp:
+  - **Architecture & Public Interface (`voice/stt.py`)**:
+    - `SpeechToTextService`: Fully local, privacy-first transcription engine converting raw linear PCM audio into structured text results without any cloud APIs, external network calls, or automatic model downloads.
+    - Public methods:
+      - `transcribe(pcm_audio: bytes) -> TranscriptionResult`: Validates audio format/alignment/duration, writes temporary 16kHz mono WAV file, invokes Whisper.cpp via non-shell subprocess (`shell=False`), extracts transcription, parses auto-detected language from stderr, and unconditionally cleans up all temporary artifacts.
+      - `is_available() -> bool`: Verifies that both the configured Whisper executable and model binary exist locally on disk.
+    - `TranscriptionResult`: Structured dataclass carrying `text: str`, `success: bool`, `error: Optional[str]`, `duration_seconds: float`, and `language: Optional[str]`.
+    - `SpeechToTextError`: Custom exception hierarchy for STT subsystem.
+  - **Whisper.cpp Subprocess Integration & Security**:
+    - Safe execution via `subprocess.run(..., shell=False, timeout=config.stt_timeout_seconds)`.
+    - No shell expansion, preventing command injection vulnerabilities.
+    - Automatic cleanup: writes canonical 16-bit 16kHz mono WAV files via `tempfile.NamedTemporaryFile` and deletes the WAV file and any Whisper sidecar output files (`.txt`, `.csv`, `.vtt`, `.srt`, `.json`) in a `finally` block on success, failure, timeout, or cancellation.
+    - Resilience to cleanup errors: catches `OSError` during unlinking and logs warnings without crashing the service or aborting valid results.
+    - Zero private data logging: diagnostic logs capture duration, language, and process exit status; raw PCM bytes and user transcription content are never logged.
+  - **Audio Compatibility & Validation**:
+    - Enforces 16,000 Hz, 1-channel (mono), 16-bit linear PCM format aligned with `VoiceConfig`.
+    - Immediate rejection without subprocess invocation for:
+      - Empty or non-bytes audio payloads (`Audio data is empty`).
+      - Unaligned PCM sample byte lengths (`len(pcm) % bytes_per_sample != 0`).
+      - Audio exceeding `max_audio_duration_seconds` (`len(pcm) > max_audio_bytes`).
+      - Incompatible sample rate or channel configuration.
+    - Handles blank/whitespace outputs: strips timestamps (`[00:00:00.000 --> ...]`) and Whisper silence markers (`[BLANK_AUDIO]`), returning `success=False, error="No speech detected in audio."` for empty transcripts to prevent hallucinated inputs.
+  - **Configuration Options (`voice/config.py`)**:
+    - `whisper_executable_path: Optional[str] = None` (path to `whisper-cli` or `main` binary).
+    - `whisper_model_path: Optional[str] = None` (path to local `ggml-*.bin` model file).
+    - `whisper_language: str = "auto"` (spoken language code or `"auto"` for automatic language identification).
+    - `stt_timeout_seconds: float = 30.0` (subprocess execution deadline).
+    - `max_audio_duration_seconds: float = 60.0` (maximum allowed audio buffer duration).
+    - `stt_threads: int = 4` (worker threads for CPU inference).
+    - `stt_output_format: str = "txt"` (`"txt"`, `"json"`, or `"stdout"`).
+    - Strict validation in `VoiceConfig.__post_init__` for non-empty language, positive timeout, positive duration, positive thread count, and valid output formats.
+  - **Prerequisites & Hardware Guidance**:
+    - Target machine specs: AMD Ryzen 5 5000-series CPU, 8 GB RAM, NVIDIA RTX 2050 (4 GB VRAM).
+    - Recommended model: `ggml-base.bin` (~142 MB, ~150-200 MB RAM) or `ggml-small.bin` (~466 MB, ~500 MB RAM) multilingual models.
+    - CPU inference: Runs reliably on CPU using 4 worker threads (`stt_threads=4`) without requiring CUDA or GPU drivers.
+    - Whisper.cpp binaries can be compiled or downloaded from official Whisper.cpp releases (e.g. `whisper-cli.exe` on Windows).
+  - **Optional Manual Transcription Test**:
+    - 1. Download `whisper-cli.exe` and `ggml-base.bin` to a local folder.
+    - 2. Instantiate `VoiceConfig(whisper_executable_path="path/to/whisper-cli.exe", whisper_model_path="path/to/ggml-base.bin")`.
+    - 3. Record or pass raw 16kHz 16-bit mono PCM bytes to `SpeechToTextService(config).transcribe(pcm_bytes)`.
+    - 4. Inspect `TranscriptionResult(success=True, text="...", language="en")`.
+  - **Testing & Verification**:
+    - `tests/test_voice_stt.py`: 24 deterministic mocked tests covering stdout parsing, `.txt` sidecar parsing, auto-detection and explicit language forwarding, empty audio rejection, unaligned PCM rejection, duration limits, missing executable/model errors, timeouts, non-zero exit codes, whitespace/blank audio handling, timestamp stripping, temporary file cleanup on success/failure/cleanup errors, safe subprocess execution (`shell=False`), and configuration validation.
+    - Total voice subsystem tests: 76 passed in 31.22s.
+    - Total repository test suite: 343 tests passing with zero regressions.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

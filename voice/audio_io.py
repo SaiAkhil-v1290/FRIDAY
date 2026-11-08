@@ -321,12 +321,18 @@ class AudioCaptureService:
         self._stop_event = threading.Event()
         self._lifecycle_lock = threading.Lock()
         self._running = False
+        self._is_stopping = False
+        self._session_id = 0
         self._overflow_count = 0
         self._last_error: Exception | None = None
 
     @property
     def is_running(self) -> bool:
-        return self._running and (self._worker_thread is not None and self._worker_thread.is_alive())
+        return (
+            self._running
+            and not self._is_stopping
+            and (self._worker_thread is not None and self._worker_thread.is_alive())
+        )
 
     @property
     def overflow_count(self) -> int:
@@ -339,11 +345,16 @@ class AudioCaptureService:
     def start(self) -> None:
         """
         Start the background capture worker.
-        Rejects starting if a previous capture worker is still active.
+        Rejects starting if a previous capture worker is still active or finalizing shutdown.
         """
         with self._lifecycle_lock:
             if self.is_running:
                 return
+
+            if self._is_stopping:
+                raise AudioDeviceError(
+                    "Cannot start capture: previous capture session is still finalizing shutdown."
+                )
 
             if self._worker_thread is not None and self._worker_thread.is_alive():
                 raise AudioDeviceError(
@@ -358,19 +369,22 @@ class AudioCaptureService:
             # Open hardware source
             self.source.open()
 
+            self._session_id += 1
+            session_id = self._session_id
             self._running = True
             self._worker_thread = threading.Thread(
                 target=self._capture_worker,
-                name="JarvisAudioCaptureWorker",
+                args=(session_id,),
+                name=f"JarvisAudioCaptureWorker-{session_id}",
                 daemon=True,
             )
             self._worker_thread.start()
 
-    def _capture_worker(self) -> None:
+    def _capture_worker(self, session_id: int) -> None:
         """Continuous background capture loop feeding the bounded queue."""
         frame_samples = self.config.frame_samples
 
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and self._session_id == session_id:
             try:
                 frame = self.source.read(frame_samples)
                 if not frame:
@@ -396,7 +410,9 @@ class AudioCaptureService:
                         pass
                 break
 
-        self._running = False
+        with self._lifecycle_lock:
+            if self._session_id == session_id:
+                self._running = False
 
     def read_frame(self, timeout: float | None = 0.1) -> bytes | None:
         """
@@ -421,39 +437,54 @@ class AudioCaptureService:
         Cleanly and deterministically halt audio capture and release resources.
         Avoids holding lifecycle locks while waiting for the worker thread.
         Releases the input source before joining the worker thread to unblock reads.
+        Prevents starting new capture sessions while shutdown is in progress.
+        Guarantees stale shutdown finalization cannot corrupt newer sessions.
         Idempotent: safe to call multiple times.
         """
         worker_to_join: threading.Thread | None = None
+        session_to_stop: int = 0
+
         with self._lifecycle_lock:
             if not self._running and (self._worker_thread is None or not self._worker_thread.is_alive()):
                 return
 
-            # 1. Signal stop event
-            self._stop_event.set()
+            if self._is_stopping:
+                worker_to_join = self._worker_thread
+                session_to_stop = self._session_id
+            else:
+                self._is_stopping = True
+                session_to_stop = self._session_id
+                self._stop_event.set()
 
-            # 2. Release or interrupt input source FIRST so blocked reads unblock
-            try:
-                self.source.close()
-            except Exception:
-                pass
+                # 1. Release or interrupt input source FIRST so blocked reads unblock
+                try:
+                    self.source.close()
+                except Exception:
+                    pass
 
-            worker_to_join = self._worker_thread
+                worker_to_join = self._worker_thread
 
-        # 3. Wait for the worker to terminate WITHOUT holding _lifecycle_lock
+        # 2. Wait for the worker to terminate WITHOUT holding _lifecycle_lock
         if worker_to_join is not None and worker_to_join.is_alive():
             worker_to_join.join(timeout=1.0)
 
-        # 4. Finalize state under lock; preserve worker reference if it failed to terminate
+        # 3. Finalize state under lock; preserve worker reference if it failed to terminate
         with self._lifecycle_lock:
-            if self._worker_thread is not None and self._worker_thread.is_alive():
-                self._running = False
-                raise AudioDeviceError(
-                    "Audio capture worker failed to terminate during shutdown."
-                )
+            if self._session_id == session_to_stop:
+                if not self._is_stopping and not self._running:
+                    return
 
-            self._worker_thread = None
-            self._running = False
-            self.clear_buffer()
+                if worker_to_join is not None and worker_to_join.is_alive():
+                    self._running = False
+                    self._is_stopping = False
+                    raise AudioDeviceError(
+                        "Audio capture worker failed to terminate during shutdown."
+                    )
+
+                self._worker_thread = None
+                self._running = False
+                self._is_stopping = False
+                self.clear_buffer()
 
     def shutdown(self) -> None:
         """Deterministic alias for stop()."""

@@ -378,6 +378,20 @@ LONG-TERM MEMORY (Local SQLite)
     - Total voice tests: 50 passed in 14.59s.
     - Total project test suite: 317 passed in 75.86s with zero regressions.
 
+- **Milestone 5.1.1.4**: Capture Shutdown/Restart Race-Condition Fix:
+  - **Root Cause**: During `AudioCaptureService.stop()`, releasing `_lifecycle_lock` while joining the background worker created a race window where another thread could invoke `start()` after the old worker terminated but before `stop()` finalized state. The original `stop()` could mistake the newly created worker for an un-terminated old worker, setting `_running = False` and raising false errors.
+  - **Exact Lifecycle Fixes**:
+    - **Shutdown-in-Progress State (`_is_stopping`)**: Explicit boolean flag set under `_lifecycle_lock` before dropping the lock to join the worker.
+    - **Rejection of Premature Start**: `start()` verifies `not self._is_stopping` and raises `AudioDeviceError("Cannot start capture: previous capture session is still finalizing shutdown.")` if an active shutdown is still joining/finalizing.
+    - **Session Identification (`_session_id`)**: Capture sessions are assigned a monotonic generation identifier. `_capture_worker` exits immediately if `self._session_id != session_id`.
+    - **Session-Scoped Finalization**: `stop()` checks `if self._session_id == session_to_stop:` and inspects the specific `worker_to_join` rather than generic thread references, guaranteeing that stale shutdowns can never alter the state of newer capture sessions.
+    - **Preserved Invariants**: `_lifecycle_lock` remains released during worker joining to prevent deadlocks, and idempotence of repeated `stop()` calls is preserved.
+  - **Testing & Verification**:
+    - `tests/test_voice_audio_io.py`: 36 unit and integration tests (added `test_start_rejected_while_stop_is_joining`, `test_stop_finalization_cannot_corrupt_new_capture_session`, and enhanced `test_repeated_start_stop_cycles` to 10 cycles).
+    - `tests/test_voice_vad.py`: 16 unit and integration tests.
+    - Total voice tests: 52 passed in 15.25s.
+    - Total project test suite: 319 passed in 69.63s with zero regressions.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

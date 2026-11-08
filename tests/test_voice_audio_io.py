@@ -203,13 +203,24 @@ class TestAudioCaptureService(unittest.TestCase):
         self.assertGreaterEqual(service.overflow_count, 0)
 
     def test_repeated_start_stop_cycles(self):
-        for cycle in range(3):
+        seen_workers = []
+        for cycle in range(10):
             self.capture_service.start()
             self.assertTrue(self.capture_service.is_running)
+            worker = self.capture_service._worker_thread
+            self.assertIsNotNone(worker)
+            seen_workers.append(worker)
+
             frame = self.capture_service.read_frame(timeout=0.2)
             self.assertIsNotNone(frame)
             self.capture_service.stop()
             self.assertFalse(self.capture_service.is_running)
+            self.assertFalse(worker.is_alive())
+
+        # Verify 10 distinct workers were cleanly started and stopped with zero abandoned threads
+        self.assertEqual(len(seen_workers), 10)
+        self.assertEqual(len(set(seen_workers)), 10)
+        self.assertIsNone(self.capture_service._worker_thread)
 
     def test_no_duplicate_workers(self):
         self.capture_service.start()
@@ -518,6 +529,114 @@ class TestCaptureShutdownAndWorkerSafety(unittest.TestCase):
             lock_acquired_during_join.is_set(),
             "AudioCaptureService.stop() held _lifecycle_lock during worker join!",
         )
+
+    def test_start_rejected_while_stop_is_joining(self):
+        """Verify that start() is rejected while stop() is waiting for worker to join."""
+        in_read_event = threading.Event()
+        stop_called_event = threading.Event()
+        worker_held_in_join = threading.Event()
+        delay_worker_exit = threading.Event()
+        start_error = []
+
+        class DelayedStopSource(AudioInputSource):
+            def __init__(self):
+                self._active = False
+
+            def open(self):
+                self._active = True
+
+            def read(self, num_samples):
+                in_read_event.set()
+                stop_called_event.wait(timeout=2.0)
+                worker_held_in_join.set()
+                delay_worker_exit.wait(timeout=2.0)
+                raise AudioReadError("Stopped")
+
+            def close(self):
+                self._active = False
+                stop_called_event.set()
+
+            @property
+            def is_active(self):
+                return self._active
+
+        src = DelayedStopSource()
+        cfg = VoiceConfig(frame_duration_ms=10)
+        service = AudioCaptureService(source=src, config=cfg)
+        service.start()
+
+        # Wait until worker is definitely blocked inside read()
+        self.assertTrue(in_read_event.wait(timeout=1.0))
+
+        def do_stop():
+            service.stop()
+
+        t_stop = threading.Thread(target=do_stop, daemon=True)
+        t_stop.start()
+
+        # Wait until stop() has closed source and worker is holding inside join window
+        self.assertTrue(worker_held_in_join.wait(timeout=1.0))
+
+        # Attempt to start while stop is in progress
+        def do_start():
+            try:
+                service.start()
+            except Exception as e:
+                start_error.append(e)
+
+        t_start = threading.Thread(target=do_start, daemon=True)
+        t_start.start()
+        t_start.join(timeout=1.0)
+
+        # start() must be rejected with AudioDeviceError
+        self.assertEqual(len(start_error), 1)
+        self.assertIsInstance(start_error[0], AudioDeviceError)
+        self.assertIn("finalizing shutdown", str(start_error[0]))
+
+        # Unblock worker and let stop complete
+        delay_worker_exit.set()
+        t_stop.join(timeout=1.0)
+        self.assertFalse(service.is_running)
+        self.assertIsNone(service._worker_thread)
+
+    def test_stop_finalization_cannot_corrupt_new_capture_session(self):
+        """Verify that an earlier stop finalization cannot reset or corrupt a newer capture session."""
+        cfg = VoiceConfig(frame_duration_ms=10)
+        mock_source = MockAudioInputSource(frame_bytes=cfg.frame_bytes)
+        service = AudioCaptureService(source=mock_source, config=cfg)
+
+        # Start session 1
+        service.start()
+        session1_id = service._session_id
+
+        # Artificially simulate that session 1 is being stopped with session_to_stop = session1_id
+        # While session 1 stop is joining, advance session to session 2
+        with service._lifecycle_lock:
+            service._is_stopping = True
+            session_to_stop = session1_id
+            service._stop_event.set()
+            # Advance to session 2
+            service._session_id = 2
+            dummy_worker_2 = threading.Thread(target=lambda: time.sleep(0.2), daemon=True)
+            dummy_worker_2.start()
+            service._worker_thread = dummy_worker_2
+            service._running = True
+            service._is_stopping = False
+
+        # Now simulate session 1 finalization running with session_to_stop = 1
+        with service._lifecycle_lock:
+            if service._session_id == session_to_stop:
+                service._worker_thread = None
+                service._running = False
+
+        # Session 2 must NOT be corrupted: worker_thread is still dummy_worker_2 and running is still True
+        self.assertIs(service._worker_thread, dummy_worker_2)
+        self.assertTrue(service._running)
+        self.assertTrue(service.is_running)
+
+        # Cleanup dummy worker 2
+        dummy_worker_2.join(timeout=1.0)
+        service.shutdown()
 
 
 class ConcurrencyTrackingSink(MockAudioOutputSink):

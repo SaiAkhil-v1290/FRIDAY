@@ -1,7 +1,7 @@
 """
-Local Wake-Word Detection Subsystem for JARVIS (Milestone 5.1.4).
+Local Wake-Word Detection Subsystem for JARVIS (Milestone 5.1.4 & 5.1.4.1).
 Continuously monitors raw PCM audio frames for a configured wake phrase (e.g. 'Hey Friday')
-using lightweight local inference without cloud dependencies or full ASR/Whisper invocations.
+using lightweight local openWakeWord ONNX inference without cloud dependencies or Whisper invocations.
 """
 
 from __future__ import annotations
@@ -13,10 +13,18 @@ import threading
 import time
 from typing import Any, Callable, Optional, Union
 
+import numpy as np
+
 from voice.config import VoiceConfig, default_voice_config
 from voice.audio_io import AudioCaptureService
 
 logger = logging.getLogger(__name__)
+
+# openWakeWord standard inference window parameters
+OPENWAKEWORD_CHUNK_DURATION_MS: int = 80
+OPENWAKEWORD_SAMPLE_RATE: int = 16000
+OPENWAKEWORD_CHUNK_SAMPLES: int = 1280  # 80ms at 16kHz
+OPENWAKEWORD_CHUNK_BYTES: int = 2560    # 1280 samples * 2 bytes/sample (16-bit PCM)
 
 
 @dataclass(frozen=True)
@@ -56,15 +64,15 @@ class WakeWordEngineError(WakeWordError):
 class WakeWordDetector:
     """
     Local Wake-Word Detection service.
-    Processes continuous PCM audio frames from AudioCaptureService, detects the configured
-    wake phrase using local inference (openWakeWord / custom backends), enforces detection cooldowns,
-    prevents duplicate activations, and operates strictly offline with zero cloud dependencies.
+    Aggregates incoming 20ms capture frames into exact 80ms (1,280 samples) int16 chunks,
+    performs local ONNX inference via openWakeWord or injected engine backends, enforces
+    phrase/model identity mapping, applies detection cooldowns, and operates strictly offline.
     """
 
     def __init__(
         self,
         config: Optional[VoiceConfig] = None,
-        engine: Optional[Union[Any, Callable[[bytes], Union[float, dict[str, float]]]]] = None,
+        engine: Optional[Union[Any, Callable[[np.ndarray], Union[float, dict[str, float]]]]] = None,
     ) -> None:
         """
         Initialize the WakeWordDetector with configuration and optional engine backend.
@@ -79,60 +87,78 @@ class WakeWordDetector:
         self._last_detection_timestamp: float = 0.0
         self._is_stopped: bool = False
         self._engine = engine
+        self._initialization_error: Optional[str] = None
 
         if self._engine is None and self.config.wake_word_engine == "openwakeword":
             self._init_openwakeword_engine()
 
     def _init_openwakeword_engine(self) -> None:
-        """Attempt to initialize the openWakeWord engine backend."""
+        """Attempt to initialize the openWakeWord ONNX engine backend once."""
         model_path = self.config.wake_word_model_path
         if not model_path:
-            logger.debug("No wake_word_model_path configured; openWakeWord engine inactive.")
+            self._initialization_error = "No wake_word_model_path configured."
+            logger.debug(self._initialization_error)
             return
 
         clean_path = model_path.strip()
         if not os.path.isfile(clean_path):
-            logger.debug("Configured wake_word_model_path does not exist on disk: %s", clean_path)
+            self._initialization_error = f"Configured wake_word_model_path not found on disk: {clean_path}"
+            logger.debug(self._initialization_error)
             return
 
         try:
             import openwakeword
             from openwakeword.model import Model
 
-            logger.info("Initializing openWakeWord model from: %s", clean_path)
-            self._engine = Model(wakeword_models=[clean_path], inference_framework="onnx")
-        except ImportError:
-            logger.debug("openwakeword package is not installed.")
+            logger.info("Initializing openWakeWord ONNX model from: %s", clean_path)
+            model_instance = Model(
+                wakeword_models=[clean_path],
+                inference_framework=self.config.wake_word_inference_framework,
+            )
+
+            # Validate that the model loaded successfully and verify model keys
+            if hasattr(model_instance, "models") and isinstance(model_instance.models, dict):
+                loaded_keys = list(model_instance.models.keys())
+                if not loaded_keys:
+                    self._initialization_error = f"openWakeWord model loaded but contains no models: {clean_path}"
+                    logger.error(self._initialization_error)
+                    return
+
+                if not any(self._key_matches_phrase(k) for k in loaded_keys):
+                    logger.warning(
+                        "Loaded openWakeWord model keys %s do not match configured phrase '%s'",
+                        loaded_keys,
+                        self.config.wake_word_phrase,
+                    )
+
+            self._engine = model_instance
+            self._initialization_error = None
+        except ImportError as e:
+            self._initialization_error = f"openwakeword package is not installed: {e}"
+            logger.debug(self._initialization_error)
             self._engine = None
         except Exception as e:
-            logger.error("Failed to initialize openWakeWord engine: %s", e)
+            self._initialization_error = f"Failed to initialize openWakeWord ONNX engine: {type(e).__name__}: {e}"
+            logger.error(self._initialization_error)
             self._engine = None
 
     def is_available(self) -> bool:
         """
-        Check if the wake-word engine backend and model are available locally.
+        Check if the wake-word engine backend and model are initialized and ready to process audio.
 
         Returns:
-            bool: True if engine is loaded and ready to process audio.
+            bool: True only if the engine was successfully loaded and initialized.
         """
         with self._lock:
             if self._is_stopped:
                 return False
-            if self._engine is not None:
-                return True
+            return self._engine is not None
 
-            # If not yet initialized, check if openWakeWord and model file exist
-            if self.config.wake_word_engine == "openwakeword":
-                model_path = self.config.wake_word_model_path
-                if not model_path or not os.path.isfile(model_path.strip()):
-                    return False
-                try:
-                    import openwakeword  # noqa: F401
-                    return True
-                except ImportError:
-                    return False
-
-            return False
+    @property
+    def initialization_error(self) -> Optional[str]:
+        """Return the initialization failure reason if unavailable, or None."""
+        with self._lock:
+            return self._initialization_error
 
     @property
     def is_active(self) -> bool:
@@ -161,9 +187,35 @@ class WakeWordDetector:
         with self._lock:
             return self._last_detection_timestamp
 
+    def _key_matches_phrase(self, key: str) -> bool:
+        """
+        Check if a model output key matches the configured phrase or explicit model key.
+
+        Args:
+            key: Output key returned by the detection engine.
+
+        Returns:
+            bool: True if key corresponds to the configured wake phrase.
+        """
+        if self.config.wake_word_model_key:
+            return key.strip().lower() == self.config.wake_word_model_key.strip().lower()
+
+        clean_key = str(key).strip().lower().replace("_", " ").replace("-", " ")
+        clean_phrase = self.config.wake_word_phrase.strip().lower().replace("_", " ").replace("-", " ")
+
+        if clean_key == clean_phrase:
+            return True
+        if key.strip().lower() == clean_phrase.replace(" ", "_"):
+            return True
+        if clean_key.startswith(clean_phrase):
+            return True
+        return False
+
     def process_frame(self, frame: bytes) -> WakeWordResult:
         """
-        Process a single incoming raw PCM audio frame.
+        Process a single incoming raw PCM audio frame (e.g. 20ms / 640 bytes).
+        Accumulates frames until an 80ms chunk (1,280 samples / 2,560 bytes) is reached,
+        converts the chunk to a signed int16 NumPy array, and runs inference.
 
         Args:
             frame: Linear PCM 16-bit mono audio bytes matching VoiceConfig.
@@ -219,136 +271,187 @@ class WakeWordDetector:
                     detected=False,
                     wake_phrase=self.config.wake_word_phrase,
                     timestamp=now,
-                    error="Wake-word engine or model file is unavailable.",
+                    error=self._initialization_error or "Wake-word engine or model file is unavailable.",
                 )
 
-            # 6. Cooldown & duplicate activation prevention
-            if self._last_detection_timestamp > 0.0:
-                elapsed_since_last = now - self._last_detection_timestamp
-                if elapsed_since_last < self.config.wake_word_cooldown_seconds:
-                    logger.debug(
-                        "Wake-word cooldown active (%.2fs < %.2fs); suppressing detection.",
-                        elapsed_since_last,
-                        self.config.wake_word_cooldown_seconds,
+            # 6. Append frame to internal audio buffer
+            self._audio_buffer.extend(frame)
+
+            # 7. Check if a complete 80ms chunk (2560 bytes = 1280 samples) is available
+            if len(self._audio_buffer) < OPENWAKEWORD_CHUNK_BYTES:
+                # Incomplete chunk: no inference call is performed
+                return WakeWordResult(
+                    detected=False,
+                    wake_phrase=self.config.wake_word_phrase,
+                    confidence=0.0,
+                    timestamp=now,
+                )
+
+            # 8. Process complete 80ms chunk(s)
+            last_confidence = 0.0
+            detected = False
+            detected_error = None
+
+            while len(self._audio_buffer) >= OPENWAKEWORD_CHUNK_BYTES:
+                # Extract exact 80ms chunk and advance buffer (retaining remainder)
+                chunk_bytes = bytes(self._audio_buffer[:OPENWAKEWORD_CHUNK_BYTES])
+                del self._audio_buffer[:OPENWAKEWORD_CHUNK_BYTES]
+
+                # Check cooldown: suppress detection if within cooldown window
+                if self._last_detection_timestamp > 0.0:
+                    elapsed_since_last = now - self._last_detection_timestamp
+                    if elapsed_since_last < self.config.wake_word_cooldown_seconds:
+                        logger.debug(
+                            "Wake-word cooldown active (%.2fs < %.2fs); suppressing detection.",
+                            elapsed_since_last,
+                            self.config.wake_word_cooldown_seconds,
+                        )
+                        continue
+
+                # Convert raw PCM bytes to signed 16-bit NumPy array
+                try:
+                    audio_array = np.frombuffer(chunk_bytes, dtype=np.int16)
+                except Exception as conv_err:
+                    return WakeWordResult(
+                        detected=False,
+                        wake_phrase=self.config.wake_word_phrase,
+                        timestamp=now,
+                        error=f"PCM to NumPy int16 conversion failed: {conv_err}",
                     )
+
+                # Invoke detection engine
+                try:
+                    raw_pred = self._invoke_engine(audio_array, chunk_bytes)
+                except Exception as eng_err:
+                    logger.error("Wake-word engine exception: %s", eng_err)
                     return WakeWordResult(
                         detected=False,
                         wake_phrase=self.config.wake_word_phrase,
                         confidence=0.0,
                         timestamp=now,
+                        error=f"Detection engine error: {type(eng_err).__name__}: {eng_err}",
                     )
 
-            # 7. Internal buffer accumulation and bounding
-            self._audio_buffer.extend(frame)
+                conf, err = self._extract_confidence(raw_pred)
+                if err is not None:
+                    detected_error = err
+                    last_confidence = 0.0
+                    continue
+
+                last_confidence = conf
+
+                # Threshold comparison
+                if conf >= self.config.wake_word_threshold:
+                    detected = True
+                    self._last_detection_timestamp = now
+                    # Clear buffer on activation to avoid repeated detections from the same utterance
+                    self._audio_buffer.clear()
+                    logger.info(
+                        "Wake-word '%s' detected with confidence %.3f (threshold=%.2f)",
+                        self.config.wake_word_phrase,
+                        conf,
+                        self.config.wake_word_threshold,
+                    )
+                    break
+
+            # 9. Enforce buffer memory bound on incomplete remainder
             max_buffer_bytes = int(
                 self.config.sample_rate
                 * self.config.bytes_per_sample
                 * self.config.wake_word_buffer_duration_sec
             )
             if len(self._audio_buffer) > max_buffer_bytes:
-                # Retain the most recent window bounded by max_buffer_bytes
                 del self._audio_buffer[:-max_buffer_bytes]
 
-            # 8. Engine prediction invocation
-            confidence = 0.0
-            try:
-                confidence = self._invoke_engine(bytes(self._audio_buffer))
-            except Exception as e:
-                logger.error("Wake-word engine exception: %s", e)
-                return WakeWordResult(
-                    detected=False,
-                    wake_phrase=self.config.wake_word_phrase,
-                    confidence=0.0,
-                    timestamp=now,
-                    error=f"Detection engine error: {type(e).__name__}: {e}",
-                )
-
-            # 9. Threshold comparison & detection transition
-            if confidence >= self.config.wake_word_threshold:
-                self._last_detection_timestamp = now
-                # Clear audio buffer on activation so the same utterance does not immediately re-trigger
-                self._audio_buffer.clear()
-                logger.info(
-                    "Wake-word '%s' detected with confidence %.3f (threshold=%.2f)",
-                    self.config.wake_word_phrase,
-                    confidence,
-                    self.config.wake_word_threshold,
-                )
+            if detected:
                 return WakeWordResult(
                     detected=True,
                     wake_phrase=self.config.wake_word_phrase,
-                    confidence=confidence,
+                    confidence=last_confidence,
                     timestamp=now,
                 )
 
             return WakeWordResult(
                 detected=False,
                 wake_phrase=self.config.wake_word_phrase,
-                confidence=confidence,
+                confidence=last_confidence,
                 timestamp=now,
+                error=detected_error,
             )
 
-    def _invoke_engine(self, pcm_data: bytes) -> float:
+    def _invoke_engine(self, audio_array: np.ndarray, chunk_bytes: bytes) -> Any:
         """
-        Invoke the underlying detection engine on PCM audio bytes.
+        Invoke the engine with signed int16 NumPy array, with adapter fallback for test mocks.
 
         Args:
-            pcm_data: Linear PCM audio bytes.
+            audio_array: NumPy ndarray of dtype int16 containing 1280 samples.
+            chunk_bytes: Original raw PCM bytes for legacy test callables.
 
         Returns:
-            float: Confidence score in [0.0, 1.0].
+            Any: Engine prediction output.
         """
         if self._engine is None:
             return 0.0
 
-        # Injectable engine callable or object with predict()
-        raw_result: Any = None
         if hasattr(self._engine, "predict"):
-            raw_result = self._engine.predict(pcm_data)
+            try:
+                return self._engine.predict(audio_array)
+            except TypeError:
+                # Adapter fallback for mocks that explicitly require bytes
+                return self._engine.predict(chunk_bytes)
         elif callable(self._engine):
-            raw_result = self._engine(pcm_data)
+            try:
+                return self._engine(audio_array)
+            except TypeError:
+                return self._engine(chunk_bytes)
         else:
-            raise WakeWordEngineError(f"Engine object {type(self._engine)} has no predict method and is not callable.")
+            raise WakeWordEngineError(
+                f"Engine {type(self._engine)} has no predict method and is not callable."
+            )
 
-        return self._extract_confidence(raw_result)
+    def _extract_confidence(self, result: Any) -> tuple[float, Optional[str]]:
+        """
+        Extract confidence score matching the configured wake phrase from engine prediction.
+        Enforces strict model key identity to prevent unrelated models from triggering detection.
 
-    def _extract_confidence(self, result: Any) -> float:
-        """Extract a normalized float confidence score from engine prediction result."""
+        Args:
+            result: Raw output from the engine (dict or scalar).
+
+        Returns:
+            tuple[float, Optional[str]]: (confidence, error_message if mismatch).
+        """
         if result is None:
-            return 0.0
+            return 0.0, None
 
         if isinstance(result, (int, float)):
-            return max(0.0, min(1.0, float(result)))
+            return max(0.0, min(1.0, float(result))), None
 
         if isinstance(result, dict):
             if not result:
-                return 0.0
+                return 0.0, None
 
-            # 1. Exact phrase match
-            norm_phrase = self.config.wake_word_phrase.strip().lower()
-            key_candidates = [
-                norm_phrase,
-                norm_phrase.replace(" ", "_"),
-                norm_phrase.replace(" ", ""),
-            ]
-            for key in key_candidates:
-                if key in result:
-                    return max(0.0, min(1.0, float(result[key])))
+            matching_val = None
+            for key, val in result.items():
+                if self._key_matches_phrase(key):
+                    matching_val = val
+                    break
 
-            # 2. Case-insensitive key match
-            for k, val in result.items():
-                k_clean = str(k).strip().lower().replace("_", " ")
-                if k_clean == norm_phrase:
-                    return max(0.0, min(1.0, float(val)))
+            if matching_val is None:
+                # Model output does not contain the configured wake phrase!
+                avail_keys = list(result.keys())
+                error_msg = (
+                    f"Model output mismatch: engine output keys {avail_keys} do not match "
+                    f"configured wake phrase '{self.config.wake_word_phrase}'."
+                )
+                logger.warning(error_msg)
+                return 0.0, error_msg
 
-            # 3. Fallback: take maximum score from dictionary values
             try:
-                numeric_vals = [float(v) for v in result.values() if isinstance(v, (int, float))]
-                return max(0.0, min(1.0, max(numeric_vals))) if numeric_vals else 0.0
+                return max(0.0, min(1.0, float(matching_val))), None
             except (ValueError, TypeError):
-                return 0.0
+                return 0.0, f"Non-numeric score for matching key: {matching_val}"
 
-        return 0.0
+        return 0.0, f"Unsupported engine prediction format: {type(result).__name__}"
 
     def listen_for_wake_word(
         self,

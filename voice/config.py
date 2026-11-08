@@ -39,7 +39,9 @@ class VoiceConfig:
     wake_word_threshold: float = 0.5
     wake_word_cooldown_seconds: float = 2.0
     wake_word_model_path: str | None = None
+    wake_word_model_key: str | None = None
     wake_word_engine: str = "openwakeword"
+    wake_word_inference_framework: str = "onnx"
     wake_word_buffer_duration_sec: float = 3.0
 
     def __post_init__(self) -> None:
@@ -101,6 +103,8 @@ class VoiceConfig:
             raise ValueError("wake_word_buffer_duration_sec must be positive.")
         if self.wake_word_engine not in ("openwakeword", "custom"):
             raise ValueError(f"Unsupported wake_word_engine='{self.wake_word_engine}'. Must be 'openwakeword' or 'custom'.")
+        if self.wake_word_inference_framework != "onnx":
+            raise ValueError(f"Unsupported wake_word_inference_framework='{self.wake_word_inference_framework}'. Only 'onnx' is supported.")
 
     @property
     def bytes_per_sample(self) -> int:

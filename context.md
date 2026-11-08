@@ -527,15 +527,16 @@ LONG-TERM MEMORY (Local SQLite)
   - **Known Limitations**:
     - Voice pipeline is standalone and not yet integrated into `main.py` or the active orchestrator conversation loop.
 
-- **Milestone 5.1.4**: Local Wake-Word Detection:
+- **Milestone 5.1.4 & 5.1.4.1**: Local Wake-Word Detection & Real openWakeWord Integration:
   - **Architecture & Component Responsibilities (`voice/wake_word.py`)**:
     - `WakeWordDetector`: Standalone, local-only wake-word detection service continuously analyzing incoming PCM audio frames from `AudioCaptureService` for a configured wake phrase (default: `"Hey Friday"`).
-    - Fully decoupled from Whisper/STT: Continuous microphone monitoring runs on lightweight acoustic models without invoking Whisper or heavy ASR on every audio frame.
+    - Decoupled from Whisper/STT: Continuous microphone monitoring runs on lightweight acoustic models without invoking Whisper or heavy ASR on every audio frame.
     - Zero cloud dependencies: Runs entirely offline on local CPU with bounded memory buffers and zero disk writes.
     - Public API:
-      - `process_frame(frame: bytes) -> WakeWordResult`: Synchronously processes a single PCM frame, validates audio alignment, manages bounded sliding window, checks cooldown, evaluates engine prediction, and returns structured result.
+      - `process_frame(frame: bytes) -> WakeWordResult`: Synchronously processes incoming PCM frames, aggregates into 80ms chunks, validates int16 NumPy conversion, enforces model key identity mapping, checks cooldown, and returns structured result.
       - `listen_for_wake_word(capture_service: AudioCaptureService, timeout: Optional[float] = None) -> Optional[WakeWordResult]`: Polls frames from capture service until wake word is detected or timeout expires.
-      - `is_available() -> bool`: Verifies that the detection engine backend and model file exist and are loadable.
+      - `is_available() -> bool`: Returns `True` only if the engine was successfully loaded and initialized (reflects actual initialization status).
+      - `initialization_error -> Optional[str]`: Structured status property exposing the exact initialization failure reason if unavailable.
       - `reset() -> None`: Clears internal audio buffers, resets cooldown timestamp, and resets engine state.
       - `stop() -> None`: Shuts down detector, releases engine resources, and marks detector inactive.
       - Properties: `is_active`, `wake_phrase`, `threshold`, `cooldown_seconds`, `last_detection_timestamp`.
@@ -544,20 +545,36 @@ LONG-TERM MEMORY (Local SQLite)
       - `wake_phrase: str`: Configured wake phrase monitored.
       - `confidence: float`: Detection confidence score in `[0.0, 1.0]`.
       - `timestamp: float`: Wall-clock Unix timestamp (`time.time()`).
-      - `error: Optional[str]`: Error message on invalid input, unavailable engine, or inference failure.
-  - **Detection Engine Selection**:
-    - Primary Engine: **openWakeWord** (Apache 2.0 license).
-    - Selection Rationale: Modern, open-source, fully offline wake-word framework running via ONNX Runtime / TFLite. Supports custom trained models (e.g. `hey_friday.onnx`, `hey_jarvis_v0.1.onnx`), native Windows/Linux compatibility, low latency, and zero commercial API key or online verification requirements (unlike Picovoice Porcupine).
-    - Modular backend abstraction: Supports injectable engines/callables (`engine` parameter) enabling deterministic unit testing, custom neural backends, or mock evaluation without requiring pre-installed binary packages.
-  - **Installation & Model Setup**:
-    - Optional package installation: `pip install openwakeword onnxruntime` (not automatically downloaded).
-    - Model configuration: Set `wake_word_model_path="path/to/hey_friday.onnx"` in `VoiceConfig`. No automatic model downloads are performed; missing models or packages cleanly report `is_available() is False`.
+      - `error: Optional[str]`: Error message on invalid input, unavailable engine, model mismatch, or inference failure.
+  - **Audio Interface & PCM-to-NumPy Conversion**:
+    - Production interface contract: openWakeWord expects 16 kHz mono signed 16-bit PCM samples as an `int16` NumPy array (`numpy.ndarray` with `dtype=numpy.int16`).
+    - Conversion: `numpy.frombuffer(chunk_bytes, dtype=numpy.int16)` directly casts 2,560 bytes into 1,280 `int16` samples without unnecessary copying or format degradation.
+  - **Audio Frame Aggregation (80ms Chunking)**:
+    - `AudioCaptureService` emits standard 20ms frames (640 bytes at 16kHz).
+    - `WakeWordDetector` accumulates frames into an internal buffer.
+    - Incomplete chunks (< 2,560 bytes / 80ms) return `detected=False, confidence=0.0` immediately without calling the detection engine.
+    - Exactly four 20ms frames produce one 80ms inference call.
+    - Retains only the incomplete remainder in the buffer for subsequent inference calls without sample duplication.
+  - **Model Identity & Output Key Matching**:
+    - openWakeWord outputs dictionary predictions mapping model names to confidence scores (e.g. `{"hey_friday": 0.85}`).
+    - The detector strictly matches the configured `wake_phrase` (or explicit `wake_word_model_key`) against the keys in the engine's output dictionary.
+    - Model mismatch guard: If the model output keys do not contain the configured phrase (e.g. an Alexa model returning 0.99 when Hey Friday is configured), detection is safely rejected with a `Model output mismatch` error. Unrelated model scores are never used.
+  - **Pretrained vs. Custom Models & Hey Friday Requirements**:
+    - openWakeWord distributes pretrained models for standard keywords (e.g. `hey_jarvis`, `alexa`).
+    - Detecting `"Hey Friday"` requires a custom-trained openWakeWord ONNX acoustic model (`hey_friday.onnx`) outputting predictions keyed by `"hey_friday"`.
+    - Configuring `"Hey Friday"` does not automatically generate a model. If no compatible model is supplied, the detector reports unavailable.
+  - **Inference Framework & Windows Compatibility**:
+    - Restricted exclusively to `"onnx"` via ONNX Runtime (`wake_word_inference_framework="onnx"`).
+    - TFLite is not claimed or supported on Windows in this implementation.
+    - Automatic model downloads are strictly prohibited.
   - **Configuration Options (`voice/config.py`)**:
-    - `wake_word_phrase: str = "Hey Friday"`: Monitored wake phrase (configurable, e.g. `"Hey Jarvis"`, `"Computer"`).
+    - `wake_word_phrase: str = "Hey Friday"`: Monitored wake phrase.
+    - `wake_word_model_key: str | None = None`: Explicit model output key name if differing from phrase.
     - `wake_word_threshold: float = 0.5`: Detection sensitivity threshold in `[0.0, 1.0]`.
     - `wake_word_cooldown_seconds: float = 2.0`: Minimum delay between activations to suppress duplicate activations.
-    - `wake_word_model_path: str | None = None`: Path to local model file (`.onnx` / `.tflite`).
+    - `wake_word_model_path: str | None = None`: Path to local `.onnx` model file.
     - `wake_word_engine: str = "openwakeword"`: Engine backend (`"openwakeword"` or `"custom"`).
+    - `wake_word_inference_framework: str = "onnx"`: Validated strictly as `"onnx"`.
     - `wake_word_buffer_duration_sec: float = 3.0`: Bounded audio history duration for sliding window analysis.
     - All fields validated strictly in `VoiceConfig.__post_init__`.
   - **Resource, Privacy & Safety Guarantees**:
@@ -565,34 +582,32 @@ LONG-TERM MEMORY (Local SQLite)
     - Zero permanent audio retention: Frames are held only in a volatile sliding bytearray buffer capped at `wake_word_buffer_duration_sec` and cleared upon activation or reset.
     - Duplicate detection prevention: Activating clears the buffer and enforces `wake_word_cooldown_seconds` so a single spoken wake phrase is never triggered repeatedly.
     - Zero Whisper usage during standby: Wake-word detection runs independently of `SpeechToTextService`.
-  - **Future Voice Controller Integration**:
-    - In future voice controller milestones, `WakeWordDetector` will run continuously on incoming capture frames while the assistant is in standby. Upon detection (`result.detected is True`), the controller transitions FRIDAY from standby to active listening, activating `VoicePipeline` to capture and transcribe the user's spoken command via VAD and Whisper.
-  - **Hardware & CPU Considerations**:
-    - Lightweight ONNX inference runs on CPU (~1-5% CPU utilization on modern x86_64 processors) without requiring GPU acceleration.
-  - **Known Limitations**:
-    - Standalone component; not yet integrated into `main.py` or the active conversation loop.
-    - Real-world detection accuracy depends on acoustic quality of the specific trained ONNX model and microphone background noise; real-world accuracy has not been measured.
+  - **Real Model Smoke Test Status**:
+    - Verified that `openwakeword` and `onnxruntime` can be installed without dependency conflicts.
+    - Real physical model inference smoke test remains blocked by the absence of a pre-trained local `hey_friday.onnx` model file on disk (no automatic model downloads permitted).
+    - The complete production openWakeWord `Model` interface contract (int16 NumPy array, 1280 samples, dict output, key matching) is comprehensively verified using strict adapter mocks.
   - **Testing & Verification**:
-    - `tests/test_voice_wake_word.py`: 20 comprehensive unit and integration tests covering:
-      - Successful wake-word detection with confidence $\ge$ threshold.
-      - Non-detection with confidence $<$ threshold.
-      - Custom wake phrases (`"Hey Jarvis"`, `"Computer"`).
+    - `tests/test_voice_wake_word.py`: 21 comprehensive unit and integration tests covering:
+      - `predict()` receiving int16 NumPy array with 1,280 samples.
+      - Exact PCM-to-NumPy conversion preserving signed waveform values.
+      - Four 20ms frames producing exactly one 80ms inference call.
+      - Sequential consecutive chunk processing without sample duplication.
+      - Matching model output keys against configured phrase.
+      - Rejecting unrelated model output keys with clear mismatch error.
+      - Explicit `wake_word_model_key` configuration matching.
+      - Missing model file, unconfigured path, and missing package returning `is_available() is False`.
+      - Model initialization exception handling and `initialization_error` property.
+      - Inference framework validation (`onnx` required).
+      - Model reset clearing model state and partial 20ms audio buffers.
+      - Stop releasing engine resources, clearing buffers, and setting inactive status.
       - Detection cooldown and duplicate activation suppression.
-      - Invalid audio handling (non-bytes, empty bytes, misaligned PCM byte lengths).
-      - Unsupported audio format rejection in `VoiceConfig`.
-      - Missing model file and unavailable engine handling.
-      - Detection engine exceptions without detector crash.
-      - Reset clearing cooldown and buffer.
-      - Shutdown, resource cleanup, and idempotent `stop()`.
-      - Repeated consecutive detection attempts across 25+ frames.
-      - Bounded internal audio buffering under high frame volume.
-      - Standard 16kHz 20ms frame-size handling (640 bytes).
-      - Strict configuration validation bounds.
-      - Zero cloud dependency (mocked socket connection verification).
-      - Zero Whisper invocation during continuous wake-word monitoring.
+      - Bounded buffer memory limits under continuous frame streams.
+      - Invalid audio handling (non-bytes, empty, misaligned).
+      - Engine exception handling during inference without detector crash.
+      - Zero cloud network calls and zero Whisper invocations during monitoring.
       - Continuous listening integration and timeout with `AudioCaptureService`.
-    - Total voice subsystem tests: 137 passed in 91.34s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`).
-    - Total repository test suite: 404 passed in 197.98s with zero regressions.
+    - Total voice subsystem tests: 138 passed in 60.75s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`).
+    - Total repository test suite: 405 passed in 174.21s with zero regressions.
 
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`

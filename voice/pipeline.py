@@ -34,6 +34,14 @@ class VoicePipelineEventType(str, Enum):
     LISTENING_STOPPED = "listening_stopped"
 
 
+CRITICAL_EVENT_TYPES = {
+    VoicePipelineEventType.LISTENING_STOPPED.value,
+    VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value,
+    VoicePipelineEventType.TRANSCRIPTION_FAILED.value,
+    VoicePipelineEventType.PIPELINE_ERROR.value,
+}
+
+
 @dataclass(frozen=True)
 class VoicePipelineEvent:
     """
@@ -41,11 +49,12 @@ class VoicePipelineEvent:
 
     Attributes:
         event_type: Type of the event (matches VoicePipelineEventType string value).
-        timestamp: Unix timestamp when the event was generated.
+        timestamp: Unix timestamp in seconds (from time.time()) when the event was generated.
         transcription: TranscriptionResult when event_type is TRANSCRIPTION_COMPLETED or TRANSCRIPTION_FAILED.
         error: Descriptive error message for error or failure events.
         audio_duration_seconds: Input audio duration in seconds, if applicable.
         truncated: True if audio buffer overflow or onset frame truncation was detected.
+        vad_timestamp_ms: Optional elapsed VAD frame timestamp in milliseconds, if applicable.
     """
     event_type: str
     timestamp: float
@@ -53,6 +62,7 @@ class VoicePipelineEvent:
     error: Optional[str] = None
     audio_duration_seconds: Optional[float] = None
     truncated: Optional[bool] = None
+    vad_timestamp_ms: Optional[float] = None
 
 
 class VoicePipelineError(Exception):
@@ -247,39 +257,84 @@ class VoicePipeline:
         except queue.Empty:
             return None
 
-    def clear_events(self) -> None:
-        """Clear all pending events from the event queue."""
-        while not self._event_queue.empty():
+    def clear_events(self) -> int:
+        """
+        Drain and clear all pending events from the event queue.
+
+        Returns:
+            int: The exact number of events removed from the queue.
+        """
+        cleared_count = 0
+        while True:
             try:
                 self._event_queue.get_nowait()
+                cleared_count += 1
             except queue.Empty:
                 break
+        return cleared_count
 
     def _publish_event(self, event: VoicePipelineEvent) -> None:
         """
-        Publish a structured event to the bounded event queue.
-        If queue is full, drops the oldest event to prevent unbounded memory growth
-        and avoid blocking the audio processing worker.
-        """
-        try:
-            self._event_queue.put_nowait(event)
-        except queue.Full:
-            try:
-                dropped = self._event_queue.get_nowait()
-                logger.warning(
-                    "VoicePipeline event queue overflow; dropped oldest event of type '%s'",
-                    dropped.event_type,
-                )
-            except queue.Empty:
-                pass
+        Publish a structured event to the bounded event queue with critical event protection.
 
-            try:
-                self._event_queue.put_nowait(event)
-            except queue.Full:
-                logger.error(
-                    "Failed to enqueue event of type '%s' even after dropping oldest",
+        If the event queue is full:
+          1. Priority retention: Ordinary events (e.g. speech_started, buffer_overflow,
+             listening_started) are discarded before critical events. The oldest ordinary
+             event in the queue is dropped to make room for the new event.
+          2. All-critical fallback: If all events currently in the queue are critical:
+             - If the incoming event is ordinary, the incoming event is dropped to protect
+               the queued critical events.
+             - If the incoming event is critical, the oldest critical event in the queue is
+               dropped (deterministic FIFO fallback for critical events) to enqueue the new critical event.
+          3. Non-blocking invariant: Enqueue and eviction operations acquire the queue's
+             internal mutex and never block or wait, ensuring the worker thread is never stalled.
+        """
+        with self._event_queue.mutex:
+            if self._event_queue._qsize() < self._event_queue.maxsize:
+                self._event_queue._put(event)
+                self._event_queue.unfinished_tasks += 1
+                self._event_queue.not_empty.notify()
+                return
+
+            is_incoming_critical = event.event_type in CRITICAL_EVENT_TYPES
+
+            # Find oldest non-critical (ordinary) event to drop
+            target_to_drop = None
+            for item in self._event_queue.queue:
+                if item.event_type not in CRITICAL_EVENT_TYPES:
+                    target_to_drop = item
+                    break
+
+            if target_to_drop is not None:
+                self._event_queue.queue.remove(target_to_drop)
+                self._event_queue.unfinished_tasks -= 1
+                logger.warning(
+                    "VoicePipeline event queue overflow; dropped oldest ordinary event '%s' to make room for '%s'",
+                    target_to_drop.event_type,
                     event.event_type,
                 )
+                self._event_queue._put(event)
+                self._event_queue.unfinished_tasks += 1
+                self._event_queue.not_empty.notify()
+            else:
+                # All queued events are critical
+                if not is_incoming_critical:
+                    logger.warning(
+                        "VoicePipeline event queue is full of critical events; dropped incoming ordinary event '%s'",
+                        event.event_type,
+                    )
+                    return
+                else:
+                    dropped = self._event_queue.queue.popleft()
+                    self._event_queue.unfinished_tasks -= 1
+                    logger.warning(
+                        "VoicePipeline event queue full of critical events; dropped oldest critical event '%s' to enqueue newest '%s'",
+                        dropped.event_type,
+                        event.event_type,
+                    )
+                    self._event_queue._put(event)
+                    self._event_queue.unfinished_tasks += 1
+                    self._event_queue.not_empty.notify()
 
     def _processing_worker(self, session_id: int) -> None:
         """
@@ -288,182 +343,255 @@ class VoicePipeline:
         """
         logger.debug("VoicePipeline processing worker started (session=%d)", session_id)
         current_utterance_overflow_emitted = False
+        consecutive_read_errors = 0
 
-        while not self._stop_event.is_set():
-            # Session validity check: exit if superseded by a newer session
-            with self._lifecycle_lock:
-                if self._session_id != session_id:
-                    logger.debug(
-                        "VoicePipeline worker session %d superseded by %d; exiting.",
-                        session_id,
-                        self._session_id,
+        try:
+            while not self._stop_event.is_set():
+                # Session validity check: exit if superseded by a newer session
+                with self._lifecycle_lock:
+                    if self._session_id != session_id:
+                        logger.debug(
+                            "VoicePipeline worker session %d superseded by %d; exiting.",
+                            session_id,
+                            self._session_id,
+                        )
+                        return
+
+                # Read PCM frame from capture service
+                try:
+                    frame = self.capture_service.read_frame(
+                        timeout=self.config.pipeline_frame_read_timeout_seconds
                     )
-                    return
-
-            # Read PCM frame from capture service
-            try:
-                frame = self.capture_service.read_frame(
-                    timeout=self.config.pipeline_frame_read_timeout_seconds
-                )
-            except Exception as e:
-                logger.warning("Error reading frame from capture service: %s", e)
-                self._publish_event(
-                    VoicePipelineEvent(
-                        event_type=VoicePipelineEventType.PIPELINE_ERROR.value,
-                        timestamp=time.time(),
-                        error=f"Capture read error: {e}",
+                    consecutive_read_errors = 0
+                except Exception as e:
+                    consecutive_read_errors += 1
+                    logger.warning(
+                        "Capture read error (%d/%d): %s",
+                        consecutive_read_errors,
+                        self.config.pipeline_max_consecutive_read_errors,
+                        e,
                     )
-                )
-                continue
-
-            if self._stop_event.is_set():
-                break
-
-            if frame is None:
-                # Timeout occurred with no frame; loop and check stop_event
-                continue
-
-            # Validate frame size
-            if len(frame) != self.config.frame_bytes:
-                logger.warning(
-                    "Invalid frame length received: %d bytes (expected %d)",
-                    len(frame),
-                    self.config.frame_bytes,
-                )
-                self._publish_event(
-                    VoicePipelineEvent(
-                        event_type=VoicePipelineEventType.PIPELINE_ERROR.value,
-                        timestamp=time.time(),
-                        error=f"Invalid frame length: {len(frame)} bytes (expected {self.config.frame_bytes})",
-                    )
-                )
-                continue
-
-            # Process frame through VoiceActivityDetector
-            try:
-                vad_events = self.vad.process_frame(frame)
-            except Exception as e:
-                logger.error("VAD processing error: %s", e)
-                self._publish_event(
-                    VoicePipelineEvent(
-                        event_type=VoicePipelineEventType.PIPELINE_ERROR.value,
-                        timestamp=time.time(),
-                        error=f"VAD processing error: {e}",
-                    )
-                )
-                continue
-
-            # Handle emitted VAD events
-            for v_event in vad_events:
-                event_ts = getattr(v_event, "timestamp_ms", None)
-                timestamp_sec = (event_ts / 1000.0) if event_ts is not None else time.time()
-
-                if v_event.event_type == "buffer_overflow":
-                    if not current_utterance_overflow_emitted:
-                        current_utterance_overflow_emitted = True
+                    if consecutive_read_errors >= self.config.pipeline_max_consecutive_read_errors:
+                        logger.error(
+                            "Maximum consecutive capture read errors (%d) reached; stopping worker cleanly.",
+                            self.config.pipeline_max_consecutive_read_errors,
+                        )
                         self._publish_event(
                             VoicePipelineEvent(
-                                event_type=VoicePipelineEventType.BUFFER_OVERFLOW.value,
-                                timestamp=timestamp_sec,
-                                error="Utterance truncated: audio buffer overflow.",
-                                truncated=True,
+                                event_type=VoicePipelineEventType.PIPELINE_ERROR.value,
+                                timestamp=time.time(),
+                                error=(
+                                    f"Maximum consecutive capture read errors "
+                                    f"({self.config.pipeline_max_consecutive_read_errors}) exceeded: {e}"
+                                ),
                             )
                         )
+                        break
 
-                elif v_event.event_type == "speech_start":
-                    current_utterance_overflow_emitted = False
-                    if getattr(v_event, "pre_speech_truncated", False):
-                        current_utterance_overflow_emitted = True
-                        self._publish_event(
-                            VoicePipelineEvent(
-                                event_type=VoicePipelineEventType.BUFFER_OVERFLOW.value,
-                                timestamp=timestamp_sec,
-                                error="Pre-speech buffer truncated: onset audio was discarded.",
-                                truncated=True,
-                            )
-                        )
                     self._publish_event(
                         VoicePipelineEvent(
-                            event_type=VoicePipelineEventType.SPEECH_STARTED.value,
-                            timestamp=timestamp_sec,
-                            truncated=getattr(v_event, "pre_speech_truncated", False),
+                            event_type=VoicePipelineEventType.PIPELINE_ERROR.value,
+                            timestamp=time.time(),
+                            error=f"Capture read error ({consecutive_read_errors}/{self.config.pipeline_max_consecutive_read_errors}): {e}",
                         )
                     )
+                    # Avoid tight busy loop on transient failures
+                    self._stop_event.wait(0.02)
+                    continue
 
-                elif v_event.event_type == "speech_end":
-                    # Truncation policy: discard truncated audio rather than transcribing incomplete utterance
-                    is_truncated = (
-                        getattr(v_event, "truncated", False)
-                        or getattr(v_event, "pre_speech_truncated", False)
-                        or current_utterance_overflow_emitted
+                if self._stop_event.is_set():
+                    break
+
+                if frame is None:
+                    # Timeout occurred with no frame; loop and check stop_event
+                    continue
+
+                # Validate frame size
+                if len(frame) != self.config.frame_bytes:
+                    logger.warning(
+                        "Invalid frame length received: %d bytes (expected %d)",
+                        len(frame),
+                        self.config.frame_bytes,
                     )
-                    current_utterance_overflow_emitted = False
-
-                    if is_truncated:
-                        logger.warning(
-                            "Truncated utterance completed; discarding audio without calling STT per truncation policy."
+                    self._publish_event(
+                        VoicePipelineEvent(
+                            event_type=VoicePipelineEventType.PIPELINE_ERROR.value,
+                            timestamp=time.time(),
+                            error=f"Invalid frame length: {len(frame)} bytes (expected {self.config.frame_bytes})",
                         )
-                        continue
-
-                    accumulated_audio = v_event.accumulated_audio
-                    if not accumulated_audio or len(accumulated_audio) == 0:
-                        logger.debug("Speech ended with empty accumulated audio; skipping STT.")
-                        continue
-
-                    duration_sec = len(accumulated_audio) / (
-                        self.config.sample_rate * self.config.bytes_per_sample
                     )
+                    continue
 
-                    # Ensure non-overlapping STT calls
-                    stt_result: Optional[TranscriptionResult] = None
-                    with self._stt_lock:
-                        if self._stop_event.is_set():
-                            # If stopped while waiting for STT lock, check session
-                            with self._lifecycle_lock:
-                                if self._session_id != session_id:
-                                    return
+                # Process frame through VoiceActivityDetector
+                try:
+                    vad_events = self.vad.process_frame(frame)
+                except Exception as e:
+                    logger.error("VAD processing error: %s", e)
+                    self._publish_event(
+                        VoicePipelineEvent(
+                            event_type=VoicePipelineEventType.PIPELINE_ERROR.value,
+                            timestamp=time.time(),
+                            error=f"VAD processing error: {e}",
+                        )
+                    )
+                    continue
 
+                # Handle emitted VAD events
+                for v_event in vad_events:
+                    vad_ms = getattr(v_event, "timestamp_ms", None)
+
+                    if v_event.event_type == "buffer_overflow":
+                        if not current_utterance_overflow_emitted:
+                            current_utterance_overflow_emitted = True
+                            self._publish_event(
+                                VoicePipelineEvent(
+                                    event_type=VoicePipelineEventType.BUFFER_OVERFLOW.value,
+                                    timestamp=time.time(),
+                                    error="Utterance truncated: audio buffer overflow.",
+                                    truncated=True,
+                                    vad_timestamp_ms=vad_ms,
+                                )
+                            )
+
+                    elif v_event.event_type == "speech_start":
+                        current_utterance_overflow_emitted = False
+                        if getattr(v_event, "pre_speech_truncated", False):
+                            current_utterance_overflow_emitted = True
+                            self._publish_event(
+                                VoicePipelineEvent(
+                                    event_type=VoicePipelineEventType.BUFFER_OVERFLOW.value,
+                                    timestamp=time.time(),
+                                    error="Pre-speech buffer truncated: onset audio was discarded.",
+                                    truncated=True,
+                                    vad_timestamp_ms=vad_ms,
+                                )
+                            )
+                        self._publish_event(
+                            VoicePipelineEvent(
+                                event_type=VoicePipelineEventType.SPEECH_STARTED.value,
+                                timestamp=time.time(),
+                                truncated=getattr(v_event, "pre_speech_truncated", False),
+                                vad_timestamp_ms=vad_ms,
+                            )
+                        )
+
+                    elif v_event.event_type == "speech_end":
+                        # Truncation policy: discard truncated audio rather than transcribing incomplete utterance
+                        is_truncated = (
+                            getattr(v_event, "truncated", False)
+                            or getattr(v_event, "pre_speech_truncated", False)
+                            or current_utterance_overflow_emitted
+                        )
+                        current_utterance_overflow_emitted = False
+
+                        if is_truncated:
+                            logger.warning(
+                                "Truncated utterance completed; discarding audio without calling STT per truncation policy."
+                            )
+                            continue
+
+                        accumulated_audio = v_event.accumulated_audio
+                        if not accumulated_audio or len(accumulated_audio) == 0:
+                            logger.debug("Speech ended with empty accumulated audio; skipping STT.")
+                            continue
+
+                        duration_sec = len(accumulated_audio) / (
+                            self.config.sample_rate * self.config.bytes_per_sample
+                        )
+
+                        # Check local STT availability before transcription
                         try:
-                            stt_result = self.stt_service.transcribe(accumulated_audio)
-                        except Exception as stt_err:
-                            logger.error("Unexpected STT exception during transcription: %s", stt_err)
+                            stt_available = self.stt_service.is_available()
+                        except Exception as avail_err:
+                            logger.error("STT availability check error: %s", avail_err)
                             self._publish_event(
                                 VoicePipelineEvent(
                                     event_type=VoicePipelineEventType.TRANSCRIPTION_FAILED.value,
                                     timestamp=time.time(),
-                                    error=f"STT execution error: {type(stt_err).__name__}: {stt_err}",
+                                    error=f"STT availability check error: {avail_err}",
                                     audio_duration_seconds=duration_sec,
                                     truncated=False,
+                                    vad_timestamp_ms=vad_ms,
                                 )
                             )
                             continue
 
-                    # Verify session ownership before publishing result
-                    with self._lifecycle_lock:
-                        if self._session_id != session_id:
-                            return
-
-                    if stt_result is not None:
-                        if stt_result.success:
-                            self._publish_event(
-                                VoicePipelineEvent(
-                                    event_type=VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value,
-                                    timestamp=time.time(),
-                                    transcription=stt_result,
-                                    audio_duration_seconds=duration_sec,
-                                    truncated=False,
-                                )
-                            )
-                        else:
+                        if not stt_available:
+                            logger.warning("Local STT service is unavailable; skipping transcription.")
                             self._publish_event(
                                 VoicePipelineEvent(
                                     event_type=VoicePipelineEventType.TRANSCRIPTION_FAILED.value,
                                     timestamp=time.time(),
-                                    transcription=stt_result,
-                                    error=stt_result.error or "Transcription failed",
+                                    error="Speech-to-text service is unavailable: local Whisper executable or model file was not found.",
                                     audio_duration_seconds=duration_sec,
                                     truncated=False,
+                                    vad_timestamp_ms=vad_ms,
                                 )
                             )
+                            continue
 
-        logger.debug("VoicePipeline processing worker exited (session=%d)", session_id)
+                        # Ensure non-overlapping STT calls
+                        stt_result: Optional[TranscriptionResult] = None
+                        with self._stt_lock:
+                            if self._stop_event.is_set():
+                                # If stopped while waiting for STT lock, check session
+                                with self._lifecycle_lock:
+                                    if self._session_id != session_id:
+                                        return
+
+                            try:
+                                stt_result = self.stt_service.transcribe(accumulated_audio)
+                            except Exception as stt_err:
+                                logger.error("Unexpected STT exception during transcription: %s", stt_err)
+                                self._publish_event(
+                                    VoicePipelineEvent(
+                                        event_type=VoicePipelineEventType.TRANSCRIPTION_FAILED.value,
+                                        timestamp=time.time(),
+                                        error=f"STT execution error: {type(stt_err).__name__}: {stt_err}",
+                                        audio_duration_seconds=duration_sec,
+                                        truncated=False,
+                                        vad_timestamp_ms=vad_ms,
+                                    )
+                                )
+                                continue
+
+                        # Verify session ownership before publishing result
+                        with self._lifecycle_lock:
+                            if self._session_id != session_id:
+                                return
+
+                        if stt_result is not None:
+                            if stt_result.success:
+                                self._publish_event(
+                                    VoicePipelineEvent(
+                                        event_type=VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value,
+                                        timestamp=time.time(),
+                                        transcription=stt_result,
+                                        audio_duration_seconds=duration_sec,
+                                        truncated=False,
+                                        vad_timestamp_ms=vad_ms,
+                                    )
+                                )
+                            else:
+                                self._publish_event(
+                                    VoicePipelineEvent(
+                                        event_type=VoicePipelineEventType.TRANSCRIPTION_FAILED.value,
+                                        timestamp=time.time(),
+                                        transcription=stt_result,
+                                        error=stt_result.error or "Transcription failed",
+                                        audio_duration_seconds=duration_sec,
+                                        truncated=False,
+                                        vad_timestamp_ms=vad_ms,
+                                    )
+                                )
+        finally:
+            if consecutive_read_errors >= self.config.pipeline_max_consecutive_read_errors:
+                try:
+                    self.capture_service.stop()
+                except Exception as stop_err:
+                    logger.debug("Error stopping capture service after read errors: %s", stop_err)
+                with self._lifecycle_lock:
+                    if self._session_id == session_id:
+                        self._running = False
+
+            logger.debug("VoicePipeline processing worker exited (session=%d)", session_id)

@@ -34,6 +34,7 @@ class VoiceConfig:
     pipeline_event_queue_size: int = 200
     pipeline_frame_read_timeout_seconds: float = 0.1
     pipeline_join_timeout_seconds: float = 2.0
+    pipeline_max_consecutive_read_errors: int = 5
 
     def __post_init__(self) -> None:
         if self.sample_rate not in (8000, 16000, 32000, 48000):
@@ -82,6 +83,8 @@ class VoiceConfig:
             raise ValueError("pipeline_frame_read_timeout_seconds must be positive.")
         if self.pipeline_join_timeout_seconds <= 0:
             raise ValueError("pipeline_join_timeout_seconds must be positive.")
+        if self.pipeline_max_consecutive_read_errors <= 0:
+            raise ValueError("pipeline_max_consecutive_read_errors must be positive.")
 
     @property
     def bytes_per_sample(self) -> int:

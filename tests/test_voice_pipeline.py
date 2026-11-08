@@ -33,6 +33,7 @@ class FakeAudioCaptureService:
         self.stop_called = 0
         self.fail_on_start = False
         self.fail_on_read = False
+        self.read_failures_remaining: int = 0
         self._stop_event = threading.Event()
 
     def start(self) -> None:
@@ -58,7 +59,9 @@ class FakeAudioCaptureService:
         self._frame_queue.put(frame)
 
     def read_frame(self, timeout: float = 0.1) -> bytes | None:
-        if self.fail_on_read:
+        if self.fail_on_read or self.read_failures_remaining > 0:
+            if self.read_failures_remaining > 0:
+                self.read_failures_remaining -= 1
             raise AudioDeviceError("Simulated audio read error")
         try:
             return self._frame_queue.get(block=True, timeout=timeout)
@@ -97,13 +100,17 @@ class FakeSTT:
         self.transcribe_calls: list[bytes] = []
         self.return_result = TranscriptionResult(text="Mocked speech", success=True)
         self.fail_with_exception = False
+        self.available: bool = True
+        self.fail_on_available: bool = False
         self.concurrent_calls = 0
         self.max_concurrent_calls = 0
         self._lock = threading.Lock()
         self.delay: float = 0.0
 
     def is_available(self) -> bool:
-        return True
+        if self.fail_on_available:
+            raise RuntimeError("Simulated STT availability check failure")
+        return self.available
 
     def transcribe(self, pcm_audio: bytes) -> TranscriptionResult:
         with self._lock:
@@ -133,6 +140,7 @@ def test_config():
         pipeline_event_queue_size=20,
         pipeline_frame_read_timeout_seconds=0.02,
         pipeline_join_timeout_seconds=1.0,
+        pipeline_max_consecutive_read_errors=3,
     )
 
 
@@ -447,9 +455,9 @@ def test_invalid_frame_handling(pipeline_fixture):
 
 
 def test_capture_read_failure(pipeline_fixture):
-    """Verify that read_frame exception emits pipeline_error without crashing worker."""
+    """Verify that transient read_frame exception emits pipeline_error without crashing worker."""
     pipeline, capture, _, _ = pipeline_fixture
-    capture.fail_on_read = True
+    capture.read_failures_remaining = 1
     pipeline.start()
 
     event = wait_for_event(pipeline, VoicePipelineEventType.PIPELINE_ERROR.value)
@@ -663,3 +671,249 @@ def test_slow_consumer_does_not_block_audio_capture_indefinitely(pipeline_fixtur
     time.sleep(0.1)
     assert pipeline.is_running
     pipeline.stop()
+
+
+# ==============================================================================
+# 5. Milestone 5.1.3.1 Correctness & Reliability Tests
+# ==============================================================================
+
+def test_speech_events_have_plausible_unix_timestamps(pipeline_fixture, test_config):
+    """Verify speech events have wall-clock Unix timestamps, not VAD elapsed frame milliseconds."""
+    pipeline, capture, vad, _ = pipeline_fixture
+    pipeline.start()
+
+    t_start = time.time()
+    # VAD elapsed frame timestamp is 45.0 ms
+    vad.queue_response([
+        make_vad_event(
+            event_type="speech_start",
+            timestamp_ms=45.0,
+            frame=b"\x00" * test_config.frame_bytes,
+        )
+    ])
+    capture.feed_frame(b"\x00" * test_config.frame_bytes)
+
+    event = wait_for_event(pipeline, VoicePipelineEventType.SPEECH_STARTED.value)
+    t_end = time.time()
+
+    # Event timestamp must be a plausible Unix timestamp (in seconds, current time)
+    assert t_start <= event.timestamp <= t_end
+    assert event.timestamp > 1_700_000_000.0
+    # Must NOT be 0.045 (which would be timestamp_ms / 1000)
+    assert event.timestamp != 0.045
+    # Elapsed VAD frame timestamp is preserved in vad_timestamp_ms
+    assert event.vad_timestamp_ms == 45.0
+
+
+def test_transient_capture_read_failure_and_recovery(pipeline_fixture, test_config):
+    """Verify that a transient capture read failure emits an error and recovers on next read."""
+    pipeline, capture, vad, _ = pipeline_fixture
+    # Configure 1 transient failure
+    capture.read_failures_remaining = 1
+    pipeline.start()
+
+    # First event should be the transient PIPELINE_ERROR
+    err_event = wait_for_event(pipeline, VoicePipelineEventType.PIPELINE_ERROR.value)
+    assert "Capture read error (1/" in err_event.error
+    assert pipeline.is_running
+
+    # Subsequent reads succeed and process frames normally
+    vad.queue_response([
+        make_vad_event(
+            event_type="speech_start",
+            timestamp_ms=10.0,
+            frame=b"\x00" * test_config.frame_bytes,
+        )
+    ])
+    capture.feed_frame(b"\x00" * test_config.frame_bytes)
+
+    speech_event = wait_for_event(pipeline, VoicePipelineEventType.SPEECH_STARTED.value)
+    assert speech_event.event_type == VoicePipelineEventType.SPEECH_STARTED.value
+    assert pipeline.is_running
+
+
+def test_persistent_capture_read_failures_clean_worker_termination_and_restart(pipeline_fixture, test_config):
+    """Verify that reaching max consecutive read errors stops worker cleanly and allows restart."""
+    pipeline, capture, vad, _ = pipeline_fixture
+    capture.fail_on_read = True
+    pipeline.start()
+
+    worker_thread = pipeline._worker_thread
+    assert worker_thread is not None
+
+    # Wait for worker thread to stop on reaching threshold (test_config has max=3)
+    worker_thread.join(timeout=2.0)
+    assert not worker_thread.is_alive()
+    assert not pipeline.is_running
+
+    # Drain and verify error events: exactly 3 error events emitted (no infinite loop)
+    errors = []
+    while True:
+        ev = pipeline.read_event(timeout=0.05)
+        if ev is None:
+            break
+        if ev.event_type == VoicePipelineEventType.PIPELINE_ERROR.value:
+            errors.append(ev)
+
+    assert len(errors) == test_config.pipeline_max_consecutive_read_errors
+    assert "Maximum consecutive capture read errors" in errors[-1].error
+
+    # Verify successful restart after failed session has terminated
+    capture.fail_on_read = False
+    pipeline.start()
+    assert pipeline.is_running
+    assert pipeline._worker_thread is not None
+    assert pipeline._worker_thread is not worker_thread
+    assert pipeline._worker_thread.is_alive()
+
+    # Feed a frame and verify normal processing in new session
+    vad.queue_response([
+        make_vad_event(
+            event_type="speech_start",
+            timestamp_ms=10.0,
+            frame=b"\x00" * test_config.frame_bytes,
+        )
+    ])
+    capture.feed_frame(b"\x00" * test_config.frame_bytes)
+
+    event = wait_for_event(pipeline, VoicePipelineEventType.SPEECH_STARTED.value)
+    assert event.event_type == VoicePipelineEventType.SPEECH_STARTED.value
+
+    pipeline.stop()
+    assert not pipeline.is_running
+
+
+def test_stt_unavailable_skips_transcription_and_emits_failure(pipeline_fixture, test_config):
+    """Verify that unavailable STT does not invoke transcribe() and emits transcription_failed."""
+    pipeline, capture, vad, stt = pipeline_fixture
+    stt.available = False
+    pipeline.start()
+
+    sample_audio = b"\x00\x00" * 16000  # 1.0 second audio
+    vad.queue_response([
+        make_vad_event(
+            event_type="speech_end",
+            timestamp_ms=500.0,
+            accumulated_audio=sample_audio,
+        )
+    ])
+    capture.feed_frame(b"\x00" * test_config.frame_bytes)
+
+    event = wait_for_event(pipeline, VoicePipelineEventType.TRANSCRIPTION_FAILED.value)
+    assert event.event_type == VoicePipelineEventType.TRANSCRIPTION_FAILED.value
+    assert "unavailable" in event.error.lower()
+    assert event.audio_duration_seconds == 1.0
+    assert len(stt.transcribe_calls) == 0
+    assert pipeline.is_running
+
+
+def test_stt_availability_exception_does_not_crash_worker_and_processes_next_utterance(pipeline_fixture, test_config):
+    """Verify that an exception in is_available() does not crash worker and allows subsequent utterances."""
+    pipeline, capture, vad, stt = pipeline_fixture
+    stt.fail_on_available = True
+    pipeline.start()
+
+    sample_audio = b"\x00\x00" * 8000  # 0.5s
+    vad.queue_response([
+        make_vad_event(
+            event_type="speech_end",
+            timestamp_ms=200.0,
+            accumulated_audio=sample_audio,
+        )
+    ])
+    capture.feed_frame(b"\x00" * test_config.frame_bytes)
+
+    # First utterance fails due to availability check exception
+    event1 = wait_for_event(pipeline, VoicePipelineEventType.TRANSCRIPTION_FAILED.value)
+    assert "availability check error" in event1.error
+    assert len(stt.transcribe_calls) == 0
+    assert pipeline.is_running
+
+    # Fix availability check
+    stt.fail_on_available = False
+    stt.available = True
+
+    # Process second utterance
+    vad.queue_response([
+        make_vad_event(
+            event_type="speech_end",
+            timestamp_ms=800.0,
+            accumulated_audio=sample_audio,
+        )
+    ])
+    capture.feed_frame(b"\x00" * test_config.frame_bytes)
+
+    event2 = wait_for_event(pipeline, VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value)
+    assert event2.event_type == VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value
+    assert event2.transcription.text == "Mocked speech"
+    assert len(stt.transcribe_calls) == 1
+
+
+def test_clear_events_returns_exact_count(pipeline_fixture):
+    """Verify clear_events() returns the exact count of removed events and empties queue."""
+    pipeline, _, _, _ = pipeline_fixture
+
+    # Empty queue returns 0
+    assert pipeline.clear_events() == 0
+
+    # Populate with 5 events
+    for i in range(5):
+        pipeline._publish_event(
+            VoicePipelineEvent(
+                event_type=VoicePipelineEventType.SPEECH_STARTED.value,
+                timestamp=time.time(),
+                error=f"test-{i}",
+            )
+        )
+
+    # Clear populated queue
+    count = pipeline.clear_events()
+    assert count == 5
+
+    # Queue must be empty afterwards
+    assert pipeline.read_event(timeout=0.01) is None
+    assert pipeline.clear_events() == 0
+
+
+def test_critical_events_priority_retention_during_queue_overflow():
+    """Verify critical events (transcription, errors, stopped) are preserved over ordinary events."""
+    custom_config = VoiceConfig(pipeline_event_queue_size=3)
+    pipeline = VoicePipeline(config=custom_config)
+
+    # Publish: ord1, crit1, ord2
+    pipeline._publish_event(VoicePipelineEvent(event_type=VoicePipelineEventType.SPEECH_STARTED.value, timestamp=time.time()))
+    pipeline._publish_event(VoicePipelineEvent(event_type=VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value, timestamp=time.time()))
+    pipeline._publish_event(VoicePipelineEvent(event_type=VoicePipelineEventType.SPEECH_DETECTED.value, timestamp=time.time()))
+    assert pipeline._event_queue.qsize() == 3
+
+    # Now publish ord3: should drop ord1
+    pipeline._publish_event(VoicePipelineEvent(event_type=VoicePipelineEventType.SPEECH_STARTED.value, timestamp=time.time()))
+    assert pipeline._event_queue.qsize() == 3
+
+    # Now publish crit2 (pipeline_error): should drop ord2
+    pipeline._publish_event(VoicePipelineEvent(event_type=VoicePipelineEventType.PIPELINE_ERROR.value, timestamp=time.time()))
+    assert pipeline._event_queue.qsize() == 3
+
+    # Now publish crit3 (transcription_failed): should drop ord3
+    pipeline._publish_event(VoicePipelineEvent(event_type=VoicePipelineEventType.TRANSCRIPTION_FAILED.value, timestamp=time.time()))
+    assert pipeline._event_queue.qsize() == 3
+
+    # Now the queue contains 3 critical events: [crit1, crit2, crit3]
+    # Publish ordinary event (buffer_overflow): must be dropped because all queued are critical
+    pipeline._publish_event(VoicePipelineEvent(event_type=VoicePipelineEventType.BUFFER_OVERFLOW.value, timestamp=time.time()))
+    assert pipeline._event_queue.qsize() == 3
+
+    # Now publish crit4 (listening_stopped): must drop oldest critical (crit1)
+    pipeline._publish_event(VoicePipelineEvent(event_type=VoicePipelineEventType.LISTENING_STOPPED.value, timestamp=time.time()))
+    assert pipeline._event_queue.qsize() == 3
+
+    # Read all remaining events and verify they are all critical: crit2, crit3, crit4
+    e1 = pipeline.read_event(timeout=0.01)
+    e2 = pipeline.read_event(timeout=0.01)
+    e3 = pipeline.read_event(timeout=0.01)
+
+    assert e1.event_type == VoicePipelineEventType.PIPELINE_ERROR.value
+    assert e2.event_type == VoicePipelineEventType.TRANSCRIPTION_FAILED.value
+    assert e3.event_type == VoicePipelineEventType.LISTENING_STOPPED.value
+    assert pipeline.read_event(timeout=0.01) is None
+

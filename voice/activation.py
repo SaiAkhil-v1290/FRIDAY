@@ -136,6 +136,7 @@ class VoiceActivationOrchestrator:
         self._lifecycle_lock = threading.RLock()
         self._running: bool = False
         self._is_stopping: bool = False
+        self._pipeline_shutdown_failed: bool = False
         self._session_id: int = 0
         self._stop_event: threading.Event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
@@ -197,6 +198,10 @@ class VoiceActivationOrchestrator:
             # Reset detector and clear stale capture frames
             self.wake_word_detector.reset()
             self.capture_service.clear_buffer()
+            try:
+                self.voice_pipeline.clear_events()
+            except Exception as clear_err:
+                logger.debug("Error clearing initial pipeline events: %s", clear_err)
 
             # 3. Start AudioCaptureService
             try:
@@ -215,6 +220,7 @@ class VoiceActivationOrchestrator:
             self._session_id += 1
             session_id = self._session_id
             self._stop_event.clear()
+            self._pipeline_shutdown_failed = False
             self._running = True
 
             self._worker_thread = threading.Thread(
@@ -245,6 +251,9 @@ class VoiceActivationOrchestrator:
         session_to_stop: int = 0
 
         with self._lifecycle_lock:
+            if self._pipeline_shutdown_failed:
+                raise VoiceActivationError("VoicePipeline failed to terminate cleanly during shutdown.")
+
             if not self._running and not self._is_stopping:
                 logger.debug("VoiceActivationOrchestrator is already stopped; stop() ignored.")
                 return
@@ -260,10 +269,13 @@ class VoiceActivationOrchestrator:
             session_to_stop = self._session_id
 
         # 1. Stop voice pipeline if running, outside lifecycle lock to avoid deadlocks
+        pipeline_stopped_cleanly = not self._pipeline_shutdown_failed
         try:
             if self.voice_pipeline.is_running:
                 self.voice_pipeline.stop()
         except Exception as e:
+            pipeline_stopped_cleanly = False
+            self._pipeline_shutdown_failed = True
             logger.warning("Error stopping voice pipeline during orchestrator shutdown: %s", e)
 
         # 2. Stop audio capture service outside lifecycle lock
@@ -288,7 +300,12 @@ class VoiceActivationOrchestrator:
         with self._lifecycle_lock:
             if self._session_id == session_to_stop:
                 self._is_stopping = False
-                if worker_exited:
+                if (
+                    worker_exited
+                    and pipeline_stopped_cleanly
+                    and not self.voice_pipeline.is_running
+                    and not self._pipeline_shutdown_failed
+                ):
                     self._worker_thread = None
                     self.wake_word_detector.reset()
                     self.capture_service.clear_buffer()
@@ -305,7 +322,16 @@ class VoiceActivationOrchestrator:
                     )
                     logger.info("VoiceActivationOrchestrator stopped cleanly (session=%d)", session_to_stop)
                 else:
-                    raise VoiceActivationError("VoiceActivationOrchestrator worker thread failed to terminate cleanly.")
+                    err_msg = "VoiceActivationOrchestrator worker or voice pipeline failed to terminate cleanly."
+                    if (
+                        not pipeline_stopped_cleanly
+                        or self.voice_pipeline.is_running
+                        or self._pipeline_shutdown_failed
+                    ):
+                        err_msg = "VoicePipeline failed to terminate cleanly during shutdown."
+                    elif not worker_exited:
+                        err_msg = "VoiceActivationOrchestrator worker thread failed to terminate cleanly."
+                    raise VoiceActivationError(err_msg)
 
     def read_event(self, timeout: Optional[float] = 0.1) -> Optional[VoiceActivationEvent]:
         """
@@ -470,7 +496,7 @@ class VoiceActivationOrchestrator:
                 if not ww_res.detected:
                     continue
 
-                # 4. Wake word detected! Publish notification events
+                # 4. Wake word detected! Publish notification event
                 now = time.time()
                 self._publish_event(
                     VoiceActivationEvent(
@@ -479,18 +505,23 @@ class VoiceActivationOrchestrator:
                         wake_word_result=ww_res,
                     )
                 )
-                self._publish_event(
-                    VoiceActivationEvent(
-                        event_type=VoiceActivationEventType.COMMAND_LISTENING_STARTED.value,
-                        timestamp=time.time(),
-                    )
-                )
 
-                # 5. Transfer frame consumption to VoicePipeline (stop consuming frames directly)
+                # 5. Clear stale pipeline events before starting new pipeline session
                 try:
-                    self.voice_pipeline.start()
+                    self.voice_pipeline.clear_events()
+                except Exception as clear_err:
+                    logger.warning("Error clearing stale pipeline events: %s", clear_err)
+
+                # 6. Transfer frame consumption to VoicePipeline (preserving post-wake capture frames)
+                try:
+                    self.voice_pipeline.start(clear_capture_buffer=False)
                 except Exception as e:
                     logger.error("VoicePipeline startup failure: %s", e)
+                    try:
+                        if self.voice_pipeline.is_running:
+                            self.voice_pipeline.stop()
+                    except Exception:
+                        pass
                     self._publish_event(
                         VoiceActivationEvent(
                             event_type=VoiceActivationEventType.COMMAND_FAILED.value,
@@ -501,7 +532,15 @@ class VoiceActivationOrchestrator:
                     self.wake_word_detector.reset()
                     continue
 
-                # 6. Consume events from VoicePipeline until a terminal event is received
+                # 7. Publish COMMAND_LISTENING_STARTED strictly after successful pipeline startup
+                self._publish_event(
+                    VoiceActivationEvent(
+                        event_type=VoiceActivationEventType.COMMAND_LISTENING_STARTED.value,
+                        timestamp=time.time(),
+                    )
+                )
+
+                # 8. Consume events from VoicePipeline until a terminal event is received
                 pipeline_active = True
                 while pipeline_active and not self._stop_event.is_set():
                     with self._lifecycle_lock:
@@ -536,10 +575,19 @@ class VoiceActivationOrchestrator:
                                     VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value,
                                     VoicePipelineEventType.TRANSCRIPTION_FAILED.value,
                                     VoicePipelineEventType.PIPELINE_ERROR.value,
+                                    VoicePipelineEventType.LISTENING_STOPPED.value,
                                 ):
                                     pipe_event = remaining
                                     break
                             if pipe_event is None:
+                                logger.warning("VoicePipeline stopped unexpectedly without terminal event.")
+                                self._publish_event(
+                                    VoiceActivationEvent(
+                                        event_type=VoiceActivationEventType.COMMAND_FAILED.value,
+                                        timestamp=time.time(),
+                                        error="VoicePipeline stopped unexpectedly without transcription result.",
+                                    )
+                                )
                                 break
 
                     if pipe_event is not None:
@@ -577,13 +625,24 @@ class VoiceActivationOrchestrator:
                             )
                             pipeline_active = False
                         elif pipe_event.event_type == VoicePipelineEventType.LISTENING_STOPPED.value:
+                            logger.warning("VoicePipeline stopped unexpectedly during active command listening.")
+                            self._publish_event(
+                                VoiceActivationEvent(
+                                    event_type=VoiceActivationEventType.COMMAND_FAILED.value,
+                                    timestamp=time.time(),
+                                    error="VoicePipeline stopped unexpectedly before transcription completed.",
+                                )
+                            )
                             pipeline_active = False
 
-                # 7. Cleanly stop VoicePipeline
+                # 9. Cleanly stop VoicePipeline and verify clean shutdown
+                pipeline_stopped_cleanly = True
                 try:
                     if self.voice_pipeline.is_running:
                         self.voice_pipeline.stop()
                 except Exception as stop_err:
+                    pipeline_stopped_cleanly = False
+                    self._pipeline_shutdown_failed = True
                     logger.error("VoicePipeline shutdown failure in worker: %s", stop_err)
                     self._publish_event(
                         VoiceActivationEvent(
@@ -593,7 +652,19 @@ class VoiceActivationOrchestrator:
                         )
                     )
 
-                # 8. Reset the wake-word detector for the next cycle
+                # Never resume standby if pipeline shutdown failed or worker is still alive
+                if not pipeline_stopped_cleanly or self.voice_pipeline.is_running:
+                    self._pipeline_shutdown_failed = True
+                    logger.critical(
+                        "VoicePipeline failed to terminate cleanly; halting activation orchestrator to prevent competing microphone consumers."
+                    )
+                    try:
+                        self.capture_service.stop()
+                    except Exception as cap_err:
+                        logger.error("Error stopping capture service after pipeline shutdown failure: %s", cap_err)
+                    break
+
+                # 10. Reset the wake-word detector for the next cycle
                 self.wake_word_detector.reset()
 
                 # If stop was requested while pipeline was running, exit loop
@@ -606,6 +677,7 @@ class VoiceActivationOrchestrator:
                 if self.voice_pipeline.is_running:
                     self.voice_pipeline.stop()
             except Exception as e:
+                self._pipeline_shutdown_failed = True
                 logger.debug("Error in final pipeline stop: %s", e)
 
             try:

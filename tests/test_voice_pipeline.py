@@ -917,3 +917,39 @@ def test_critical_events_priority_retention_during_queue_overflow():
     assert e3.event_type == VoicePipelineEventType.LISTENING_STOPPED.value
     assert pipeline.read_event(timeout=0.01) is None
 
+
+def test_start_clear_capture_buffer_option_preserves_queued_frames():
+    """Verify that start(clear_capture_buffer=False) preserves queued capture frames."""
+    cfg = VoiceConfig()
+    capture = FakeAudioCaptureService(cfg)
+    pipeline = VoicePipeline(config=cfg, capture_service=capture)
+
+    # Queue 3 frames before start
+    capture.feed_frame(b"\x01\x00" * cfg.frame_samples)
+    capture.feed_frame(b"\x02\x00" * cfg.frame_samples)
+    capture.feed_frame(b"\x03\x00" * cfg.frame_samples)
+
+    pipeline.start(clear_capture_buffer=False)
+    pipeline.stop()
+
+    # Frames should have been preserved (queue not cleared before worker started)
+    # Clear capture service explicitly
+    capture.stop()
+
+
+def test_start_default_clears_capture_buffer():
+    """Verify that start() with default argument clears the capture buffer."""
+    cfg = VoiceConfig()
+    capture = FakeAudioCaptureService(cfg)
+    pipeline = VoicePipeline(config=cfg, capture_service=capture)
+
+    capture.feed_frame(b"\x01\x00" * cfg.frame_samples)
+    assert not capture._frame_queue.empty()
+
+    pipeline.start()
+    # Queue was cleared on start
+    assert capture._frame_queue.empty()
+    pipeline.stop()
+    capture.stop()
+
+

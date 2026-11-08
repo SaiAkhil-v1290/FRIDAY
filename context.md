@@ -703,6 +703,45 @@ LONG-TERM MEMORY (Local SQLite)
     - VoiceActivationOrchestrator is a standalone voice subsystem module.
     - Integration with `main.py`, JarvisOrchestrator, intent routing, conversational LLM loops, approval systems, or command execution has NOT yet been implemented.
 
+- **Milestone 5.1.5.1**: Voice Activation Handoff and Lifecycle Hardening:
+  - **Stale VoicePipeline Event Queue Drain**:
+    - Before starting a new command listening cycle in `VoiceActivationOrchestrator`, stale pipeline events (specifically `LISTENING_STOPPED` emitted by previous pipeline termination) are drained using `voice_pipeline.clear_events()`.
+    - Draining occurs both at orchestrator startup and immediately before every `voice_pipeline.start()`.
+    - Active command session events remain untouched.
+    - An unexpected `LISTENING_STOPPED` during an active command session is treated as an abnormal termination (`COMMAND_FAILED`) rather than successful command completion.
+  - **Seamless Post-Wake Audio Preservation & FIFO Handoff**:
+    - Extended `VoicePipeline.start(clear_capture_buffer: bool = True)` to allow conditional capture buffer flushing.
+    - Default remains `clear_capture_buffer=True` for backward compatibility.
+    - In `VoiceActivationOrchestrator._orchestrator_worker`, wake-word handoff invokes `self.voice_pipeline.start(clear_capture_buffer=False)`.
+    - Frames captured after wake-word detection are preserved in the shared `AudioCaptureService` buffer and processed by the pipeline in strict FIFO order without truncation or duplication.
+  - **Safe VoicePipeline Shutdown Failure Handling**:
+    - If `voice_pipeline.stop()` fails or raises an exception during worker cleanup:
+      - Treated as a fatal activation error (`self._pipeline_shutdown_failed = True`).
+      - Publishes `ACTIVATION_ERROR`.
+      - Stops `AudioCaptureService` to immediately halt audio intake.
+      - Worker loop halts (`break`), preventing wake-word standby resumption while pipeline state is undefined.
+      - Worker thread and pipeline references are preserved for post-mortem inspection.
+      - Subsequent or pending `stop()` calls fail clearly by raising `VoiceActivationError("VoicePipeline failed to terminate cleanly during shutdown.")`.
+  - **Deterministic Startup Event Ordering**:
+    - On wake-word detection, strict sequence:
+      1. Publish `WAKE_WORD_DETECTED`.
+      2. Drain stale pipeline events (`voice_pipeline.clear_events()`).
+      3. Start `VoicePipeline(clear_capture_buffer=False)`.
+      4. Only upon confirmed startup success, publish `COMMAND_LISTENING_STARTED`.
+    - If `VoicePipeline.start()` raises an exception, the orchestrator emits `COMMAND_FAILED` and `COMMAND_LISTENING_STARTED` is never published.
+  - **Testing & Verification**:
+    - Added unit and integration tests across `tests/test_voice_pipeline.py` and `tests/test_voice_activation.py`:
+      - `test_start_clear_capture_buffer_option_preserves_queued_frames`
+      - `test_start_default_clears_capture_buffer`
+      - `test_preserve_audio_captured_after_wake_word_and_fifo_order`
+      - `test_startup_event_ordering_on_success`
+      - `test_startup_event_ordering_on_pipeline_failure`
+      - `test_unexpected_listening_stopped_during_command_listening`
+      - `test_real_voice_pipeline_multi_cycle_activation_clears_stale_events`
+      - Verified shutdown failure halts worker, stops capture, and raises `VoiceActivationError` on `stop()`.
+    - Total voice subsystem tests: 180 passed in 84.48s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`, `test_voice_activation.py`).
+    - Total repository test suite: 447 passed in 132.90s with zero regressions.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

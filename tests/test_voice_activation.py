@@ -150,11 +150,14 @@ class MockVoicePipeline:
         self.stop_called = 0
         self.fail_on_start = False
         self.fail_on_stop = False
+        self.last_clear_capture_buffer = None
+        self.clear_events_called = 0
         self.event_queue: queue.Queue[VoicePipelineEvent] = queue.Queue()
         self.on_start_callback = None
         self._lock = threading.Lock()
 
-    def start(self) -> None:
+    def start(self, clear_capture_buffer: bool = True) -> None:
+        self.last_clear_capture_buffer = clear_capture_buffer
         if self.fail_on_start:
             raise VoicePipelineError("Simulated pipeline startup error")
         with self._lock:
@@ -169,9 +172,27 @@ class MockVoicePipeline:
         with self._lock:
             self.is_running = False
             self.stop_called += 1
+        # Replicate real VoicePipeline behavior of publishing LISTENING_STOPPED on stop
+        self.event_queue.put(
+            VoicePipelineEvent(
+                event_type=VoicePipelineEventType.LISTENING_STOPPED.value,
+                timestamp=time.time(),
+            )
+        )
 
     def queue_event(self, event: VoicePipelineEvent) -> None:
         self.event_queue.put(event)
+
+    def clear_events(self) -> int:
+        self.clear_events_called += 1
+        cleared = 0
+        while not self.event_queue.empty():
+            try:
+                self.event_queue.get_nowait()
+                cleared += 1
+            except queue.Empty:
+                break
+        return cleared
 
     def read_event(self, timeout: float = 0.1) -> VoicePipelineEvent | None:
         try:
@@ -782,7 +803,10 @@ def test_voice_pipeline_startup_failure(base_config):
 
 
 def test_voice_pipeline_shutdown_failure(base_config):
-    """Verify that failure to stop pipeline emits ACTIVATION_ERROR without crashing orchestrator."""
+    """
+    Verify that failure to stop pipeline emits ACTIVATION_ERROR, halts the orchestrator worker,
+    stops AudioCaptureService, does not resume wake-word standby, and calling stop() fails clearly.
+    """
     capture = MockAudioCaptureService(base_config)
     detector = MockWakeWordDetector(base_config, available=True)
     pipeline = MockVoicePipeline(base_config, capture)
@@ -811,6 +835,269 @@ def test_voice_pipeline_shutdown_failure(base_config):
 
     ev = wait_for_event(orchestrator, VoiceActivationEventType.ACTIVATION_ERROR.value)
     assert "VoicePipeline shutdown failure" in ev.error
+
+    # Give worker a moment to terminate
+    time.sleep(0.1)
+
+    # 1. Standby must NOT resume
+    assert orchestrator.is_running is False
+    # 2. Capture must be stopped
+    assert capture.is_running is False
+    # 3. Calling stop() must raise VoiceActivationError because pipeline failed to terminate cleanly
+    with pytest.raises(VoiceActivationError, match="VoicePipeline failed to terminate cleanly"):
+        orchestrator.stop()
+
+
+def test_preserve_audio_captured_after_wake_word_and_fifo_order(base_config):
+    """
+    Verify that frames queued after wake-word detection are preserved
+    when VoicePipeline starts (clear_capture_buffer=False) and received in FIFO order.
+    """
+    capture = MockAudioCaptureService(base_config)
+    detector = MockWakeWordDetector(base_config, available=True)
+    pipeline = MockVoicePipeline(base_config, capture)
+
+    received_frames = []
+    pipeline_started_event = threading.Event()
+
+    def on_pipeline_start():
+        pipeline_started_event.set()
+        while True:
+            f = capture.read_frame(timeout=0.01)
+            if f is None:
+                break
+            received_frames.append(f)
+
+    pipeline.on_start_callback = on_pipeline_start
+
+    orchestrator = VoiceActivationOrchestrator(
+        config=base_config,
+        capture_service=capture,
+        wake_word_detector=detector,
+        voice_pipeline=pipeline,
+    )
+    orchestrator.start()
+
+    # 1. Trigger wake-word on next frame
+    detector.trigger_on_next_frame(confidence=0.90)
+
+    # Feed wake frame
+    wake_frame = b"\xaa\xbb" * base_config.frame_samples
+    capture.feed_frame(wake_frame)
+
+    # 2. Feed 3 post-wake speech frames before pipeline consumes them
+    frame1 = b"\x01\x01" * base_config.frame_samples
+    frame2 = b"\x02\x02" * base_config.frame_samples
+    frame3 = b"\x03\x03" * base_config.frame_samples
+    capture.feed_frame(frame1)
+    capture.feed_frame(frame2)
+    capture.feed_frame(frame3)
+
+    # Wait for pipeline to start
+    assert pipeline_started_event.wait(timeout=2.0) is True
+
+    # 3. Verify pipeline was started with clear_capture_buffer=False
+    assert pipeline.last_clear_capture_buffer is False
+
+    # 4. Verify all post-wake frames reached the pipeline in exact FIFO order
+    assert len(received_frames) == 3
+    assert received_frames[0] == frame1
+    assert received_frames[1] == frame2
+    assert received_frames[2] == frame3
+
+    orchestrator.stop()
+
+
+def test_startup_event_ordering_on_success(base_config):
+    """
+    Verify event ordering on wake-word detection:
+    1. WAKE_WORD_DETECTED
+    2. COMMAND_LISTENING_STARTED (strictly after pipeline start)
+    """
+    capture = MockAudioCaptureService(base_config)
+    detector = MockWakeWordDetector(base_config, available=True)
+    pipeline = MockVoicePipeline(base_config, capture)
+
+    orchestrator = VoiceActivationOrchestrator(
+        config=base_config,
+        capture_service=capture,
+        wake_word_detector=detector,
+        voice_pipeline=pipeline,
+    )
+    orchestrator.start()
+    wait_for_event(orchestrator, VoiceActivationEventType.LISTENING_STARTED.value)
+
+    detector.trigger_on_next_frame(confidence=0.88)
+    capture.feed_frame(b"\x00\x00" * base_config.frame_samples)
+
+    ev1 = wait_for_event(orchestrator, VoiceActivationEventType.WAKE_WORD_DETECTED.value)
+    ev2 = wait_for_event(orchestrator, VoiceActivationEventType.COMMAND_LISTENING_STARTED.value)
+
+    assert ev1.event_type == VoiceActivationEventType.WAKE_WORD_DETECTED.value
+    assert ev2.event_type == VoiceActivationEventType.COMMAND_LISTENING_STARTED.value
+    assert pipeline.start_called >= 1
+
+    orchestrator.stop()
+
+
+def test_startup_event_ordering_on_pipeline_failure(base_config):
+    """
+    Verify that if pipeline.start() fails:
+    1. WAKE_WORD_DETECTED is emitted
+    2. COMMAND_FAILED is emitted
+    3. COMMAND_LISTENING_STARTED is NEVER emitted
+    """
+    capture = MockAudioCaptureService(base_config)
+    detector = MockWakeWordDetector(base_config, available=True)
+    pipeline = MockVoicePipeline(base_config, capture)
+    pipeline.fail_on_start = True
+
+    orchestrator = VoiceActivationOrchestrator(
+        config=base_config,
+        capture_service=capture,
+        wake_word_detector=detector,
+        voice_pipeline=pipeline,
+    )
+    orchestrator.start()
+    wait_for_event(orchestrator, VoiceActivationEventType.LISTENING_STARTED.value)
+
+    detector.trigger_on_next_frame(confidence=0.88)
+    capture.feed_frame(b"\x00\x00" * base_config.frame_samples)
+
+    ev_ww = wait_for_event(orchestrator, VoiceActivationEventType.WAKE_WORD_DETECTED.value)
+    assert ev_ww.event_type == VoiceActivationEventType.WAKE_WORD_DETECTED.value
+
+    ev_failed = wait_for_event(orchestrator, VoiceActivationEventType.COMMAND_FAILED.value)
+    assert "VoicePipeline startup failure" in ev_failed.error
+
+    # Ensure COMMAND_LISTENING_STARTED was never published
+    events = []
+    while True:
+        e = orchestrator.read_event(timeout=0.01)
+        if e is None:
+            break
+        events.append(e)
+
+    types = [e.event_type for e in events]
+    assert VoiceActivationEventType.COMMAND_LISTENING_STARTED.value not in types
+
+    orchestrator.stop()
+
+
+def test_unexpected_listening_stopped_during_command_listening(base_config):
+    """
+    Verify that receiving LISTENING_STOPPED from pipeline during active command listening
+    is handled as an abnormal termination (COMMAND_FAILED), not as success.
+    """
+    capture = MockAudioCaptureService(base_config)
+    detector = MockWakeWordDetector(base_config, available=True)
+    pipeline = MockVoicePipeline(base_config, capture)
+
+    orchestrator = VoiceActivationOrchestrator(
+        config=base_config,
+        capture_service=capture,
+        wake_word_detector=detector,
+        voice_pipeline=pipeline,
+    )
+    orchestrator.start()
+
+    detector.trigger_on_next_frame(confidence=0.88)
+    capture.feed_frame(b"\x00\x00" * base_config.frame_samples)
+    wait_for_event(orchestrator, VoiceActivationEventType.COMMAND_LISTENING_STARTED.value)
+
+    # Inject unexpected LISTENING_STOPPED into pipeline
+    pipeline.queue_event(
+        VoicePipelineEvent(
+            event_type=VoicePipelineEventType.LISTENING_STOPPED.value,
+            timestamp=time.time(),
+        )
+    )
+
+    ev_failed = wait_for_event(orchestrator, VoiceActivationEventType.COMMAND_FAILED.value)
+    assert "VoicePipeline stopped unexpectedly" in ev_failed.error
+
+    orchestrator.stop()
+
+
+def test_real_voice_pipeline_multi_cycle_activation_clears_stale_events(base_config):
+    """
+    Integration test using the actual VoicePipeline class and event queue.
+    Executes at least two complete activation cycles to prove:
+      1. LISTENING_STOPPED published by pipeline.stop() in cycle 1 is drained
+      2. Cycle 2 starts with a clean pipeline queue and does not abort prematurely
+      3. Both cycles transcribe commands successfully
+    """
+    from voice.vad import VoiceActivityDetector
+
+    capture = MockAudioCaptureService(base_config)
+    detector = MockWakeWordDetector(base_config, available=True)
+
+    fake_vad = MagicMock(spec=VoiceActivityDetector)
+    fake_vad.reset = MagicMock()
+
+    fake_stt = MagicMock()
+    fake_stt.is_available.return_value = True
+
+    # Real VoicePipeline instance
+    pipeline = VoicePipeline(
+        config=base_config,
+        capture_service=capture,
+        vad=fake_vad,
+        stt_service=fake_stt,
+    )
+
+    orchestrator = VoiceActivationOrchestrator(
+        config=base_config,
+        capture_service=capture,
+        wake_word_detector=detector,
+        voice_pipeline=pipeline,
+    )
+    orchestrator.start()
+
+    # === CYCLE 1 ===
+    detector.trigger_on_next_frame(confidence=0.90)
+    capture.feed_frame(b"\x00\x00" * base_config.frame_samples)
+    wait_for_event(orchestrator, VoiceActivationEventType.COMMAND_LISTENING_STARTED.value)
+
+    # Deliver transcription completion in real pipeline event queue
+    pipeline._publish_event(
+        VoicePipelineEvent(
+            event_type=VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value,
+            timestamp=time.time(),
+            transcription=TranscriptionResult(text="cycle 1 command", success=True),
+            audio_duration_seconds=1.5,
+        )
+    )
+
+    ev1 = wait_for_event(orchestrator, VoiceActivationEventType.COMMAND_TRANSCRIBED.value)
+    assert ev1.transcription.text == "cycle 1 command"
+
+    # Allow worker to finish cycle 1 cleanup (which calls pipeline.stop(), enqueueing LISTENING_STOPPED in pipeline)
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if not pipeline.is_running and capture.is_running:
+            break
+        time.sleep(0.02)
+    assert pipeline.is_running is False
+    assert capture.is_running is True
+
+    # === CYCLE 2 ===
+    detector.trigger_on_next_frame(confidence=0.92)
+    capture.feed_frame(b"\x00\x00" * base_config.frame_samples)
+    wait_for_event(orchestrator, VoiceActivationEventType.COMMAND_LISTENING_STARTED.value)
+
+    # Deliver transcription completion for cycle 2
+    pipeline._publish_event(
+        VoicePipelineEvent(
+            event_type=VoicePipelineEventType.TRANSCRIPTION_COMPLETED.value,
+            timestamp=time.time(),
+            transcription=TranscriptionResult(text="cycle 2 command", success=True),
+            audio_duration_seconds=2.0,
+        )
+    )
+
+    ev2 = wait_for_event(orchestrator, VoiceActivationEventType.COMMAND_TRANSCRIBED.value)
+    assert ev2.transcription.text == "cycle 2 command"
 
     orchestrator.stop()
 

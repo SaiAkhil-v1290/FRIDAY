@@ -117,10 +117,15 @@ class VoicePipeline:
         with self._lifecycle_lock:
             return self._running
 
-    def start(self) -> None:
+    def start(self, clear_capture_buffer: bool = True) -> None:
         """
         Start the voice processing pipeline and background worker.
         Idempotent if already running.
+
+        Args:
+            clear_capture_buffer: If True (default), flushes volatile frames currently in
+                the capture service queue. Set to False when handoff audio frames from a
+                preceding component (such as wake-word detection) should be preserved.
 
         Raises:
             VoicePipelineError: If a previous shutdown is still finalizing or worker fails to start.
@@ -140,9 +145,10 @@ class VoicePipeline:
                     "Cannot start pipeline: worker thread from previous session is still alive."
                 )
 
-            # Reset VAD and clear stale capture frames
+            # Reset VAD and conditionally clear stale capture frames
             self.vad.reset()
-            self.capture_service.clear_buffer()
+            if clear_capture_buffer:
+                self.capture_service.clear_buffer()
 
             # Start audio capture service
             try:

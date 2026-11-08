@@ -447,6 +447,61 @@ LONG-TERM MEMORY (Local SQLite)
     - Total voice subsystem tests: 84 passed in 54.68s.
     - Total repository test suite: 351 tests passing with zero regressions.
 
+- **Milestone 5.1.3**: Voice Pipeline Orchestration:
+  - **Architecture & Component Responsibilities (`voice/pipeline.py`)**:
+    - `VoicePipeline`: Asynchronous orchestration engine connecting local audio capture (`AudioCaptureService`), Voice Activity Detection (`VoiceActivityDetector`), and Speech-to-Text transcription (`SpeechToTextService`) into a unified, thread-safe, local-only processing pipeline.
+    - Processing flow: Captures raw PCM audio frames -> feeds frames to VAD -> buffers speech audio upon `speech_start` -> detects silence threshold `speech_end` -> serializes STT transcription -> delivers structured events to consumers via a bounded queue.
+    - Fully decoupled from FRIDAY's main conversation loop, enabling standalone testing and verification without active LLM dependencies or cloud connections.
+    - Public API:
+      - `start()`: Initializes and starts underlying capture service (if not already running), resets session generation, and launches the dedicated pipeline worker thread. Prevents starting while an earlier stop is finalizing.
+      - `stop()`: Signals worker shutdown, stops underlying capture service, releases lifecycle lock while joining the background thread, and clears active session state idempotently.
+      - `is_running: bool`: Read-only property indicating active pipeline status.
+      - `read_event(timeout: Optional[float] = None) -> Optional[VoicePipelineEvent]`: Thread-safe retrieval of incoming pipeline events with optional timeout.
+      - `clear_events() -> int`: Clears all pending events from the internal queue, returning the count of cleared events.
+  - **Structured Event Delivery (`VoicePipelineEvent`)**:
+    - `VoicePipelineEventType`: Literal string type supporting `"speech_started"`, `"speech_ended"`, `"transcription_ready"`, and `"error"`.
+    - `VoicePipelineEvent`: Dataclass containing:
+      - `event_type: VoicePipelineEventType`
+      - `text: Optional[str] = None`
+      - `error: Optional[str] = None`
+      - `duration_seconds: float = 0.0`
+      - `timestamp: float = 0.0`
+      - `audio_bytes: Optional[bytes] = None`
+      - `language: Optional[str] = None`
+  - **Threading, Concurrency & Lifecycle Hardening**:
+    - Generational `session_id`: Monotonic counter incremented on every `start()`. Worker threads verify their generation and exit cleanly if preempted or mismatched.
+    - Shutdown synchronization: `_is_stopping` state flag prevents race conditions where a concurrent `start()` could be called while `stop()` is joining the worker.
+    - Lock decoupling: Worker thread joins occur outside `_lifecycle_lock` to avoid deadlocks.
+    - STT Serialization: `_stt_lock` guarantees Whisper.cpp transcriptions execute strictly sequentially without concurrency conflicts or resource contention.
+  - **Truncated Utterance Policy**:
+    - Detects utterances marked as truncated by VAD (`event.truncated` or `event.pre_speech_truncated`).
+    - Discards incomplete audio immediately rather than submitting corrupted or truncated waveforms to Whisper.cpp.
+    - Emits a structured `VoicePipelineEventType.ERROR` notifying consumers that the utterance exceeded maximum audio duration and was safely dropped.
+  - **Bounded Queue & Overflow Policy**:
+    - Configured via `pipeline_event_queue_size` (default 200 items).
+    - Employs a drop-oldest overflow strategy upon encountering `queue.Full`: safely drops the stalest event from the queue, logs a warning, and enqueues the latest event.
+    - Ensures microphone capture and VAD processing never stall or lock up due to slow or stalled downstream consumers.
+  - **Configuration Extensions (`voice/config.py`)**:
+    - `pipeline_event_queue_size: int = 200`: Maximum events retained in memory before dropping oldest.
+    - `pipeline_frame_read_timeout_seconds: float = 0.1`: Bounded wait time for frame acquisition in worker loop.
+    - `pipeline_join_timeout_seconds: float = 2.0`: Maximum deadline for background worker termination.
+    - Strict positive validation in `VoiceConfig.__post_init__` for all pipeline configuration parameters.
+  - **Testing & Verification**:
+    - `tests/test_voice_pipeline.py`: 26 comprehensive unit and integration tests covering:
+      - Normal speech-to-transcription lifecycle (`speech_started` -> `speech_ended` -> `transcription_ready`).
+      - Injected mock audio capture, VAD, and STT services.
+      - Multiple consecutive utterances and sequential STT execution.
+      - Handling of non-speech frames and silent audio.
+      - STT errors and empty transcription results.
+      - STT unavailable handling.
+      - Truncated utterance discarding and error event generation.
+      - Bounded event queue overflow policy (drop-oldest).
+      - Thread lifecycle: start, stop, restart, double-start, double-stop, rapid cycling.
+      - Worker shutdown timeouts and thread safety under concurrent stop calls.
+      - Event queue clearing and timed reading.
+    - Total voice subsystem tests: 110 passed in 59.51s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`).
+    - Total repository test suite: 377 passed in 137.89s with zero regressions.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

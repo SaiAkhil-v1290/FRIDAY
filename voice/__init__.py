@@ -25,6 +25,12 @@ from voice.stt import (
     TranscriptionResult,
     SpeechToTextError,
 )
+from voice.pipeline import (
+    VoicePipeline,
+    VoicePipelineEvent,
+    VoicePipelineEventType,
+    VoicePipelineError,
+)
 
 __all__ = [
     "VoiceConfig",
@@ -44,4 +50,8 @@ __all__ = [
     "SpeechToTextService",
     "TranscriptionResult",
     "SpeechToTextError",
+    "VoicePipeline",
+    "VoicePipelineEvent",
+    "VoicePipelineEventType",
+    "VoicePipelineError",
 ]

@@ -31,6 +31,9 @@ class VoiceConfig:
     max_audio_duration_seconds: float = 60.0
     stt_threads: int = 4
     stt_output_format: str = "txt"
+    pipeline_event_queue_size: int = 200
+    pipeline_frame_read_timeout_seconds: float = 0.1
+    pipeline_join_timeout_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         if self.sample_rate not in (8000, 16000, 32000, 48000):
@@ -73,6 +76,12 @@ class VoiceConfig:
             raise ValueError("stt_threads must be positive.")
         if self.stt_output_format not in ("txt", "json", "stdout"):
             raise ValueError(f"Unsupported stt_output_format='{self.stt_output_format}'. Must be 'txt', 'json', or 'stdout'.")
+        if self.pipeline_event_queue_size <= 0:
+            raise ValueError("pipeline_event_queue_size must be positive.")
+        if self.pipeline_frame_read_timeout_seconds <= 0:
+            raise ValueError("pipeline_frame_read_timeout_seconds must be positive.")
+        if self.pipeline_join_timeout_seconds <= 0:
+            raise ValueError("pipeline_join_timeout_seconds must be positive.")
 
     @property
     def bytes_per_sample(self) -> int:

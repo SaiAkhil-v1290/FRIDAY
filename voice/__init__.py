@@ -31,6 +31,13 @@ from voice.pipeline import (
     VoicePipelineEventType,
     VoicePipelineError,
 )
+from voice.wake_word import (
+    WakeWordDetector,
+    WakeWordResult,
+    WakeWordError,
+    WakeWordModelError,
+    WakeWordEngineError,
+)
 
 __all__ = [
     "VoiceConfig",
@@ -54,4 +61,9 @@ __all__ = [
     "VoicePipelineEvent",
     "VoicePipelineEventType",
     "VoicePipelineError",
+    "WakeWordDetector",
+    "WakeWordResult",
+    "WakeWordError",
+    "WakeWordModelError",
+    "WakeWordEngineError",
 ]

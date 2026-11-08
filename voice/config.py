@@ -35,6 +35,12 @@ class VoiceConfig:
     pipeline_frame_read_timeout_seconds: float = 0.1
     pipeline_join_timeout_seconds: float = 2.0
     pipeline_max_consecutive_read_errors: int = 5
+    wake_word_phrase: str = "Hey Friday"
+    wake_word_threshold: float = 0.5
+    wake_word_cooldown_seconds: float = 2.0
+    wake_word_model_path: str | None = None
+    wake_word_engine: str = "openwakeword"
+    wake_word_buffer_duration_sec: float = 3.0
 
     def __post_init__(self) -> None:
         if self.sample_rate not in (8000, 16000, 32000, 48000):
@@ -85,6 +91,16 @@ class VoiceConfig:
             raise ValueError("pipeline_join_timeout_seconds must be positive.")
         if self.pipeline_max_consecutive_read_errors <= 0:
             raise ValueError("pipeline_max_consecutive_read_errors must be positive.")
+        if not self.wake_word_phrase or not self.wake_word_phrase.strip():
+            raise ValueError("wake_word_phrase cannot be empty.")
+        if not (0.0 <= self.wake_word_threshold <= 1.0):
+            raise ValueError("wake_word_threshold must be between 0.0 and 1.0.")
+        if self.wake_word_cooldown_seconds < 0:
+            raise ValueError("wake_word_cooldown_seconds cannot be negative.")
+        if self.wake_word_buffer_duration_sec <= 0:
+            raise ValueError("wake_word_buffer_duration_sec must be positive.")
+        if self.wake_word_engine not in ("openwakeword", "custom"):
+            raise ValueError(f"Unsupported wake_word_engine='{self.wake_word_engine}'. Must be 'openwakeword' or 'custom'.")
 
     @property
     def bytes_per_sample(self) -> int:

@@ -43,6 +43,10 @@ class VoiceConfig:
     wake_word_engine: str = "openwakeword"
     wake_word_inference_framework: str = "onnx"
     wake_word_buffer_duration_sec: float = 3.0
+    activation_event_queue_size: int = 200
+    activation_frame_read_timeout_seconds: float = 0.1
+    activation_pipeline_event_timeout_seconds: float = 0.1
+    activation_join_timeout_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         if self.sample_rate not in (8000, 16000, 32000, 48000):
@@ -105,6 +109,14 @@ class VoiceConfig:
             raise ValueError(f"Unsupported wake_word_engine='{self.wake_word_engine}'. Must be 'openwakeword' or 'custom'.")
         if self.wake_word_inference_framework != "onnx":
             raise ValueError(f"Unsupported wake_word_inference_framework='{self.wake_word_inference_framework}'. Only 'onnx' is supported.")
+        if self.activation_event_queue_size <= 0:
+            raise ValueError("activation_event_queue_size must be positive.")
+        if self.activation_frame_read_timeout_seconds <= 0:
+            raise ValueError("activation_frame_read_timeout_seconds must be positive.")
+        if self.activation_pipeline_event_timeout_seconds <= 0:
+            raise ValueError("activation_pipeline_event_timeout_seconds must be positive.")
+        if self.activation_join_timeout_seconds <= 0:
+            raise ValueError("activation_join_timeout_seconds must be positive.")
 
     @property
     def bytes_per_sample(self) -> int:

@@ -625,6 +625,84 @@ LONG-TERM MEMORY (Local SQLite)
     - Total voice subsystem tests: 145 passed in 66.93s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`).
     - Total repository test suite: 412 passed in 167.13s with zero regressions.
 
+- **Milestone 5.1.5**: Voice Activation Orchestrator:
+  - **Architecture & Component Responsibilities (`voice/activation.py`)**:
+    - `VoiceActivationOrchestrator`: Standalone voice activation subsystem coordinating `WakeWordDetector`, `AudioCaptureService`, `VoicePipeline`, and local Whisper STT into a continuous wake-word-driven voice interaction loop.
+    - Public API:
+      - `start() -> None`: Starts capture and background coordination worker after verifying wake-word detector availability; idempotent if running.
+      - `stop() -> None`: Halts pipeline and capture, unblocks and cleanly joins background worker, resets detector, and finalizes state; idempotent if stopped.
+      - `is_running -> bool`: Property reflecting active worker status and absence of finalizing shutdown.
+      - `read_event(timeout: Optional[float] = 0.1) -> Optional[VoiceActivationEvent]`: Non-blocking or timed retrieval of activation events.
+      - `clear_events() -> int`: Drains all pending events from the bounded queue and returns the exact cleared count.
+    - Dependency Injection & Component Wiring:
+      - Constructor accepts `config`, `capture_service`, `wake_word_detector`, and `voice_pipeline`.
+      - **Strict Single-Capture Contract**: `VoiceActivationOrchestrator` asserts that `voice_pipeline.capture_service is self.capture_service`. If conflicting capture service instances are injected, initialization raises `VoiceActivationError` to prevent independent microphone reader conflicts.
+      - Defaults instantiate components sharing the identical `VoiceConfig` and `AudioCaptureService` instance.
+  - **Activation Lifecycle & Microphone Consumer Handoff**:
+    - **Standby Mode**: Worker reads audio frames from `AudioCaptureService` and passes them to `WakeWordDetector`. Whisper is never called during standby.
+    - **Wake Word Detection**: When `WakeWordDetector` detects wake word above threshold:
+      - Publishes `WAKE_WORD_DETECTED` with `WakeWordResult`.
+      - Publishes `COMMAND_LISTENING_STARTED`.
+      - Orchestrator halts direct frame reading from `AudioCaptureService`.
+      - Starts `VoicePipeline` on the shared capture service.
+      - **Zero Concurrent Consumers**: Microphone queue is consumed strictly by one component at a time (detector during standby, pipeline during command listening).
+    - **Command Completion / Failure**:
+      - Upon `TRANSCRIPTION_COMPLETED`: publishes `COMMAND_TRANSCRIBED` with `TranscriptionResult` and duration.
+      - Upon `TRANSCRIPTION_FAILED`: publishes `COMMAND_FAILED` with error details.
+      - Stops `VoicePipeline` cleanly.
+      - Calls `WakeWordDetector.reset()` (clearing buffers and cooldown without releasing engine resources).
+      - Restarts `AudioCaptureService` and resumes standby wake-word monitoring.
+  - **Event Model (`VoiceActivationEvent`)**:
+    - Immutable dataclass containing `event_type`, `timestamp`, `transcription`, `wake_word_result`, `error`, `audio_duration_seconds`.
+    - Event Types (`VoiceActivationEventType`):
+      - `LISTENING_STARTED`: Standby listening started.
+      - `WAKE_WORD_DETECTED`: Wake word detected above confidence threshold.
+      - `COMMAND_LISTENING_STARTED`: Voice pipeline started recording speech.
+      - `COMMAND_TRANSCRIBED`: Speech successfully transcribed by local Whisper.cpp.
+      - `COMMAND_FAILED`: Speech transcription failed, timed out, or pipeline errored.
+      - `ACTIVATION_ERROR`: Critical error in capture, detector, or lifecycle.
+      - `LISTENING_STOPPED`: Orchestrator and capture stopped cleanly.
+  - **Queue Overflow & Priority Retention**:
+    - Event queue bounded by `activation_event_queue_size: int = 200`.
+    - Critical events (`COMMAND_TRANSCRIBED`, `COMMAND_FAILED`, `ACTIVATION_ERROR`, `LISTENING_STOPPED`) receive priority over ordinary status events (`LISTENING_STARTED`, `WAKE_WORD_DETECTED`, `COMMAND_LISTENING_STARTED`). When full, the oldest ordinary event is dropped first.
+  - **Concurrency & Lifecycle Safeguards**:
+    - Monotonically increasing `_session_id` guarantees stale worker threads cannot corrupt newer session state.
+    - `_is_stopping` state flag prevents start-during-stop races.
+    - Worker thread joins execute strictly outside `_lifecycle_lock` to avoid deadlocks.
+    - Bounded join timeout via `activation_join_timeout_seconds: float = 2.0`.
+    - Terminal shutdown guarantees `capture_service.stop()` and `voice_pipeline.stop()` on all exit paths.
+    - Ownership contract: `WakeWordDetector.stop()` is only invoked if the detector was created internally by the orchestrator.
+  - **Configuration Options (`voice/config.py`)**:
+    - `activation_event_queue_size: int = 200`
+    - `activation_frame_read_timeout_seconds: float = 0.1`
+    - `activation_pipeline_event_timeout_seconds: float = 0.1`
+    - `activation_join_timeout_seconds: float = 2.0`
+    - Strictly validated in `VoiceConfig.__post_init__`.
+  - **Testing & Verification**:
+    - `tests/test_voice_activation.py`: 28 comprehensive unit and integration tests covering:
+      - Startup success and availability verification.
+      - Startup rejection when detector is unavailable.
+      - Wake-word standby without STT or Whisper calls.
+      - Wake-word detection activating VoicePipeline.
+      - Transcription completion publishing `COMMAND_TRANSCRIBED`.
+      - Transcription failure publishing `COMMAND_FAILED`.
+      - Standby resumption after successful transcription and after failed command.
+      - Shared `AudioCaptureService` verification and mismatched wiring rejection.
+      - Single-consumer microphone queue invariant (max concurrent readers <= 1).
+      - Idempotent `start()` and `stop()`.
+      - Stop during audio wait, during pipeline processing, and during transcription.
+      - Error resilience: capture startup failure, capture read error, detector exception, pipeline startup/shutdown failures.
+      - Bounded queue overflow and critical event priority retention.
+      - Multi-cycle restart after clean shutdown.
+      - Stale worker session isolation.
+      - Worker thread termination and resource cleanup.
+      - Event clearing and empty queue behavior.
+    - Total voice subsystem tests: 173 passed in 120.40s.
+    - Total repository test suite: 440 passed in 190.72s with zero regressions.
+  - **Known Limitations & Phase Boundary**:
+    - VoiceActivationOrchestrator is a standalone voice subsystem module.
+    - Integration with `main.py`, JarvisOrchestrator, intent routing, conversational LLM loops, approval systems, or command execution has NOT yet been implemented.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

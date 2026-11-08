@@ -38,6 +38,12 @@ from voice.wake_word import (
     WakeWordModelError,
     WakeWordEngineError,
 )
+from voice.activation import (
+    VoiceActivationOrchestrator,
+    VoiceActivationEvent,
+    VoiceActivationEventType,
+    VoiceActivationError,
+)
 
 __all__ = [
     "VoiceConfig",
@@ -66,4 +72,8 @@ __all__ = [
     "WakeWordError",
     "WakeWordModelError",
     "WakeWordEngineError",
+    "VoiceActivationOrchestrator",
+    "VoiceActivationEvent",
+    "VoiceActivationEventType",
+    "VoiceActivationError",
 ]

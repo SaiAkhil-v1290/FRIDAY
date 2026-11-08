@@ -6,6 +6,7 @@ Provides local, privacy-preserving speech transcription via Whisper.cpp.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 import os
 import re
@@ -184,13 +185,10 @@ class SpeechToTextService:
 
         # 7. Safe temporary WAV file lifecycle
         temp_wav_path: Optional[str] = None
-        txt_output_path: Optional[str] = None
 
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
                 temp_wav_path = temp_wav.name
-
-            txt_output_path = temp_wav_path + ".txt"
 
             with wave.open(temp_wav_path, "wb") as wav_file:
                 wav_file.setnchannels(self.config.channels)
@@ -209,9 +207,12 @@ class SpeechToTextService:
             ]
             if self.config.stt_output_format == "txt":
                 cmd.append("-otxt")
+            elif self.config.stt_output_format == "json":
+                cmd.append("-oj")
 
             logger.debug(
-                "Executing Whisper STT: duration=%.2fs, language=%s, threads=%d",
+                "Executing Whisper STT: format=%s, duration=%.2fs, language=%s, threads=%d",
+                self.config.stt_output_format,
                 duration_seconds,
                 self.config.whisper_language,
                 self.config.stt_threads,
@@ -256,23 +257,136 @@ class SpeechToTextService:
                     duration_seconds=duration_seconds,
                 )
 
-            # 9. Extract transcribed text
+            # 9. Detect language from stderr if configured as 'auto'
+            detected_language = self._parse_language(proc.stderr, self.config.whisper_language)
+
+            # 10. Extract transcribed text according to configured format
             raw_text = ""
-            if os.path.isfile(txt_output_path):
+
+            if self.config.stt_output_format == "txt":
+                txt_output_path = temp_wav_path + ".txt"
+                if not os.path.isfile(txt_output_path):
+                    logger.warning("Whisper TXT output file not found at: %s", txt_output_path)
+                    return TranscriptionResult(
+                        text="",
+                        success=False,
+                        error=f"Whisper TXT output file was not generated: {os.path.basename(txt_output_path)}",
+                        duration_seconds=duration_seconds,
+                    )
                 try:
                     with open(txt_output_path, "r", encoding="utf-8", errors="replace") as f:
                         raw_text = f.read()
                 except OSError as e:
-                    logger.warning("Failed to read output text file: %s", e)
+                    logger.warning("Failed to read Whisper TXT output file: %s", e)
+                    return TranscriptionResult(
+                        text="",
+                        success=False,
+                        error=f"Failed to read Whisper TXT output file: {e}",
+                        duration_seconds=duration_seconds,
+                    )
 
-            if not raw_text and proc.stdout:
-                raw_text = proc.stdout
+            elif self.config.stt_output_format == "json":
+                json_output_path = temp_wav_path + ".json"
+                if not os.path.isfile(json_output_path):
+                    logger.warning("Whisper JSON output file not found at: %s", json_output_path)
+                    return TranscriptionResult(
+                        text="",
+                        success=False,
+                        error=f"Whisper JSON output file was not generated: {os.path.basename(json_output_path)}",
+                        duration_seconds=duration_seconds,
+                    )
+                try:
+                    with open(json_output_path, "r", encoding="utf-8") as f:
+                        json_content = f.read()
+                except OSError as e:
+                    logger.warning("Failed to read Whisper JSON output file: %s", e)
+                    return TranscriptionResult(
+                        text="",
+                        success=False,
+                        error=f"Failed to read Whisper JSON output file: {e}",
+                        duration_seconds=duration_seconds,
+                    )
 
-            # Clean and parse text
+                if not json_content.strip():
+                    return TranscriptionResult(
+                        text="",
+                        success=False,
+                        error="Whisper JSON output file is empty.",
+                        duration_seconds=duration_seconds,
+                    )
+
+                try:
+                    data = json.loads(json_content)
+                except json.JSONDecodeError as e:
+                    return TranscriptionResult(
+                        text="",
+                        success=False,
+                        error=f"Invalid JSON in Whisper output: {e.msg}",
+                        duration_seconds=duration_seconds,
+                    )
+
+                if not isinstance(data, dict):
+                    return TranscriptionResult(
+                        text="",
+                        success=False,
+                        error="Invalid JSON structure: top-level JSON must be an object.",
+                        duration_seconds=duration_seconds,
+                    )
+
+                # Extract text from supported Whisper.cpp JSON schemas
+                extracted_text: Optional[str] = None
+                if "text" in data and isinstance(data["text"], str):
+                    extracted_text = data["text"]
+                elif "transcription" in data:
+                    t_val = data["transcription"]
+                    if isinstance(t_val, str):
+                        extracted_text = t_val
+                    elif isinstance(t_val, list):
+                        segments = []
+                        valid_segments = True
+                        for item in t_val:
+                            if isinstance(item, dict) and "text" in item and isinstance(item["text"], str):
+                                seg_str = item["text"].strip()
+                                if seg_str:
+                                    segments.append(seg_str)
+                            elif isinstance(item, str):
+                                if item.strip():
+                                    segments.append(item.strip())
+                            else:
+                                valid_segments = False
+                                break
+
+                        if not valid_segments:
+                            return TranscriptionResult(
+                                text="",
+                                success=False,
+                                error="Invalid JSON structure: transcription segments missing valid 'text' field.",
+                                duration_seconds=duration_seconds,
+                            )
+                        extracted_text = " ".join(segments)
+
+                if extracted_text is None:
+                    return TranscriptionResult(
+                        text="",
+                        success=False,
+                        error="Whisper JSON output missing expected transcription field ('text' or 'transcription').",
+                        duration_seconds=duration_seconds,
+                    )
+
+                raw_text = extracted_text
+
+                # Optionally supplement detected language from JSON metadata
+                if detected_language is None:
+                    if "result" in data and isinstance(data["result"], dict) and isinstance(data["result"].get("language"), str):
+                        detected_language = data["result"]["language"].lower()
+                    elif "language" in data and isinstance(data["language"], str):
+                        detected_language = data["language"].lower()
+
+            elif self.config.stt_output_format == "stdout":
+                raw_text = proc.stdout or ""
+
+            # 11. Clean and validate transcription
             cleaned_text = self._clean_transcription(raw_text)
-
-            # Detect language from stderr if language is 'auto'
-            detected_language = self._parse_language(proc.stderr, self.config.whisper_language)
 
             # Handle empty or blank transcriptions
             if not cleaned_text:
@@ -280,6 +394,27 @@ class SpeechToTextService:
                     text="",
                     success=False,
                     error="No speech detected in audio.",
+                    duration_seconds=duration_seconds,
+                    language=detected_language,
+                )
+
+            # Reject unprintable / corrupted characters
+            printable_ratio = sum(1 for ch in cleaned_text if ch.isprintable()) / len(cleaned_text)
+            if printable_ratio < 0.8:
+                return TranscriptionResult(
+                    text="",
+                    success=False,
+                    error="Malformed transcription output: unexpected unprintable characters.",
+                    duration_seconds=duration_seconds,
+                    language=detected_language,
+                )
+
+            # Reject output containing no recognizable alphanumeric characters (pure punctuation, noise symbols)
+            if not any(ch.isalnum() for ch in cleaned_text):
+                return TranscriptionResult(
+                    text="",
+                    success=False,
+                    error="Transcription output contains no recognizable speech content.",
                     duration_seconds=duration_seconds,
                     language=detected_language,
                 )
@@ -302,7 +437,7 @@ class SpeechToTextService:
             )
 
         finally:
-            # 10. Clean up temporary files on success, failure, and cancellation
+            # 12. Clean up temporary files on success, failure, and cancellation
             if temp_wav_path:
                 self._cleanup_temp_files(temp_wav_path)
 
@@ -310,6 +445,7 @@ class SpeechToTextService:
     def _clean_transcription(raw_text: str) -> str:
         """
         Clean raw Whisper output: strip timestamps, blank audio markers, and whitespace.
+        Preserves all valid multilingual spoken text.
         """
         if not raw_text:
             return ""
@@ -317,10 +453,20 @@ class SpeechToTextService:
         # Remove timestamp markers like [00:00:00.000 --> 00:00:02.000]
         text = re.sub(r"\[\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}\]\s*", "", raw_text)
 
-        # Remove known blank/silence markers emitted by whisper.cpp
-        text = re.sub(r"\[(BLANK_AUDIO|silence|\*|\s*)\]", "", text, flags=re.IGNORECASE)
+        # Remove known blank/silence markers emitted by whisper.cpp in brackets or parentheses
+        text = re.sub(
+            r"\[(BLANK_AUDIO|silence|music|applause|laughter|screaming|groan|sigh|cough|snort|inaudible|unintelligible|\*|\s*)\]",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"\((BLANK_AUDIO|silence|music|applause|laughter|screaming|groan|sigh|cough|snort|inaudible|unintelligible|\*|\s*)\)",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
 
-        # Strip remaining whitespace
         return text.strip()
 
     @staticmethod
@@ -347,7 +493,7 @@ class SpeechToTextService:
         """
         Safely remove temporary WAV and any Whisper-generated sidecar files.
         """
-        for ext in ("", ".txt", ".csv", ".vtt", ".srt", ".json"):
+        for ext in ("", ".txt", ".json", ".csv", ".vtt", ".srt"):
             target = base_wav_path + ext if ext else base_wav_path
             if os.path.exists(target):
                 try:

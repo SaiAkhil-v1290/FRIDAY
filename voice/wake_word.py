@@ -67,6 +67,13 @@ class WakeWordDetector:
     Aggregates incoming 20ms capture frames into exact 80ms (1,280 samples) int16 chunks,
     performs local ONNX inference via openWakeWord or injected engine backends, enforces
     phrase/model identity mapping, applies detection cooldowns, and operates strictly offline.
+
+    Audio format requirements:
+        The openWakeWord backend requires 16 kHz mono signed 16-bit PCM audio (1,280 samples /
+        80ms chunks). Sample rates other than 16,000 Hz are rejected during detector
+        initialization when wake_word_engine == 'openwakeword'.
+        If custom backends ('custom') are used with other audio configurations, the custom
+        backend is responsible for resampling, frame aggregation, and format adaptation.
     """
 
     def __init__(
@@ -80,8 +87,19 @@ class WakeWordDetector:
         Args:
             config: Shared VoiceConfig. Defaults to default_voice_config.
             engine: Optional injectable engine backend or callable for testing / custom models.
+
+        Raises:
+            ValueError: If sample_rate != 16000 and wake_word_engine == 'openwakeword'.
         """
         self.config = config or default_voice_config
+
+        if self.config.wake_word_engine == "openwakeword" and self.config.sample_rate != 16000:
+            raise ValueError(
+                f"openWakeWord backend requires sample_rate=16000 Hz, got sample_rate={self.config.sample_rate}. "
+                "openWakeWord operates exclusively on 16 kHz mono signed 16-bit PCM audio. "
+                "Resampling is not supported in this milestone."
+            )
+
         self._lock = threading.RLock()
         self._audio_buffer = bytearray()
         self._last_detection_timestamp: float = 0.0
@@ -321,7 +339,7 @@ class WakeWordDetector:
 
                 # Invoke detection engine
                 try:
-                    raw_pred = self._invoke_engine(audio_array, chunk_bytes)
+                    raw_pred = self._invoke_engine(audio_array)
                 except Exception as eng_err:
                     logger.error("Wake-word engine exception: %s", eng_err)
                     return WakeWordResult(
@@ -379,31 +397,28 @@ class WakeWordDetector:
                 error=detected_error,
             )
 
-    def _invoke_engine(self, audio_array: np.ndarray, chunk_bytes: bytes) -> Any:
+    def _invoke_engine(self, audio_array: np.ndarray) -> Any:
         """
-        Invoke the engine with signed int16 NumPy array, with adapter fallback for test mocks.
+        Invoke the engine backend with signed int16 NumPy array.
+        Directly passes the int16 NumPy array to predict() or the callable engine.
+        Does not catch or hide TypeErrors with raw bytes retries.
 
         Args:
-            audio_array: NumPy ndarray of dtype int16 containing 1280 samples.
-            chunk_bytes: Original raw PCM bytes for legacy test callables.
+            audio_array: NumPy ndarray of dtype int16 containing 1,280 samples (80ms at 16 kHz).
 
         Returns:
-            Any: Engine prediction output.
+            Any: Engine prediction output (dict of scores or scalar confidence).
+
+        Raises:
+            WakeWordEngineError: If engine backend has no predict method and is not callable.
         """
         if self._engine is None:
             return 0.0
 
         if hasattr(self._engine, "predict"):
-            try:
-                return self._engine.predict(audio_array)
-            except TypeError:
-                # Adapter fallback for mocks that explicitly require bytes
-                return self._engine.predict(chunk_bytes)
+            return self._engine.predict(audio_array)
         elif callable(self._engine):
-            try:
-                return self._engine(audio_array)
-            except TypeError:
-                return self._engine(chunk_bytes)
+            return self._engine(audio_array)
         else:
             raise WakeWordEngineError(
                 f"Engine {type(self._engine)} has no predict method and is not callable."

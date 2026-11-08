@@ -527,7 +527,7 @@ LONG-TERM MEMORY (Local SQLite)
   - **Known Limitations**:
     - Voice pipeline is standalone and not yet integrated into `main.py` or the active orchestrator conversation loop.
 
-- **Milestone 5.1.4 & 5.1.4.1**: Local Wake-Word Detection & Real openWakeWord Integration:
+- **Milestone 5.1.4, 5.1.4.1 & 5.1.4.2**: Local Wake-Word Detection, Real openWakeWord Integration & Compatibility Hardening:
   - **Architecture & Component Responsibilities (`voice/wake_word.py`)**:
     - `WakeWordDetector`: Standalone, local-only wake-word detection service continuously analyzing incoming PCM audio frames from `AudioCaptureService` for a configured wake phrase (default: `"Hey Friday"`).
     - Decoupled from Whisper/STT: Continuous microphone monitoring runs on lightweight acoustic models without invoking Whisper or heavy ASR on every audio frame.
@@ -546,9 +546,21 @@ LONG-TERM MEMORY (Local SQLite)
       - `confidence: float`: Detection confidence score in `[0.0, 1.0]`.
       - `timestamp: float`: Wall-clock Unix timestamp (`time.time()`).
       - `error: Optional[str]`: Error message on invalid input, unavailable engine, model mismatch, or inference failure.
+  - **NumPy Dependency Declaration (`requirements.txt`)**:
+    - Explicitly declared `numpy>=1.26.0` in `requirements.txt` to eliminate transitive dependency hazards.
+    - Verified clean dependency installation: Created fresh virtual environment (`test_clean_venv`), installed `requirements.txt` cleanly, and confirmed `from voice import WakeWordDetector` imports successfully.
   - **Audio Interface & PCM-to-NumPy Conversion**:
     - Production interface contract: openWakeWord expects 16 kHz mono signed 16-bit PCM samples as an `int16` NumPy array (`numpy.ndarray` with `dtype=numpy.int16`).
     - Conversion: `numpy.frombuffer(chunk_bytes, dtype=numpy.int16)` directly casts 2,560 bytes into 1,280 `int16` samples without unnecessary copying or format degradation.
+  - **openWakeWord Sample-Rate Contract Enforcement**:
+    - openWakeWord operates exclusively on 16 kHz mono signed 16-bit PCM (1,280 samples per 80ms chunk).
+    - `WakeWordDetector.__init__` validates `sample_rate == 16000` when `wake_word_engine == 'openwakeword'`. Incompatible sample rates (8 kHz, 32 kHz, 48 kHz) fail immediately with a clear `ValueError`.
+    - Existing audio configuration behavior remains intact: `VoiceConfig` permits 8 kHz, 32 kHz, and 48 kHz for VAD, audio capture, and STT without regression.
+    - Custom backends (`wake_word_engine == 'custom'`) allow other sample rates, with resampling and chunking being the responsibility of the custom backend.
+  - **Elimination of Unsafe TypeError Fallback**:
+    - `_invoke_engine()` passes the `int16` NumPy array directly to `self._engine.predict()` or `self._engine()`.
+    - Removed unsafe `except TypeError` fallback that previously retried inference with raw bytes.
+    - Any `TypeError` raised inside model inference is caught by the detector's standard error-handling path, logged, and returned in `WakeWordResult.error` without triggering a duplicate prediction call.
   - **Audio Frame Aggregation (80ms Chunking)**:
     - `AudioCaptureService` emits standard 20ms frames (640 bytes at 16kHz).
     - `WakeWordDetector` accumulates frames into an internal buffer.
@@ -587,7 +599,7 @@ LONG-TERM MEMORY (Local SQLite)
     - Real physical model inference smoke test remains blocked by the absence of a pre-trained local `hey_friday.onnx` model file on disk (no automatic model downloads permitted).
     - The complete production openWakeWord `Model` interface contract (int16 NumPy array, 1280 samples, dict output, key matching) is comprehensively verified using strict adapter mocks.
   - **Testing & Verification**:
-    - `tests/test_voice_wake_word.py`: 21 comprehensive unit and integration tests covering:
+    - `tests/test_voice_wake_word.py`: 28 comprehensive unit and integration tests covering:
       - `predict()` receiving int16 NumPy array with 1,280 samples.
       - Exact PCM-to-NumPy conversion preserving signed waveform values.
       - Four 20ms frames producing exactly one 80ms inference call.
@@ -606,8 +618,12 @@ LONG-TERM MEMORY (Local SQLite)
       - Engine exception handling during inference without detector crash.
       - Zero cloud network calls and zero Whisper invocations during monitoring.
       - Continuous listening integration and timeout with `AudioCaptureService`.
-    - Total voice subsystem tests: 138 passed in 60.75s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`).
-    - Total repository test suite: 405 passed in 174.21s with zero regressions.
+      - Sample rate contract: 16 kHz works, 8 kHz, 32 kHz, and 48 kHz rejected with `ValueError` for openWakeWord backend.
+      - Custom backend allows non-16 kHz sample rates.
+      - Existing VAD/audio config behavior remains unchanged across 8k, 16k, 32k, 48k.
+      - `TypeError` inside `predict()` propagates to `res.error` without causing a second prediction call.
+    - Total voice subsystem tests: 145 passed in 66.93s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`).
+    - Total repository test suite: 412 passed in 167.13s with zero regressions.
 
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`

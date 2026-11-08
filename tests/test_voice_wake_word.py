@@ -534,3 +534,102 @@ def test_listen_for_wake_word_integration(base_config):
     assert res.detected is True
     assert res.wake_phrase == "Hey Friday"
     assert res.confidence == 0.95
+
+
+# ==============================================================================
+# 12. Audio Format and Sample Rate Contract Enforcement (Milestone 5.1.4.2)
+# ==============================================================================
+
+def test_openwakeword_16khz_sample_rate_works(base_config):
+    """Verify detector initialization succeeds with 16000 Hz."""
+    mock_model = RealStyleOpenWakeWordModelMock(return_score=0.85)
+    detector = WakeWordDetector(config=base_config, engine=mock_model)
+    assert detector.is_available() is True
+
+    frame = b"\x00\x00" * base_config.frame_samples
+    for _ in range(4):
+        res = detector.process_frame(frame)
+    assert res.detected is True
+    assert res.confidence == 0.85
+
+
+@pytest.mark.parametrize("invalid_rate", [8000, 32000, 48000])
+def test_openwakeword_rejects_incompatible_sample_rates(invalid_rate, tmp_path):
+    """
+    Verify that 8 kHz, 32 kHz, and 48 kHz are rejected during detector
+    initialization when using the openWakeWord backend.
+    """
+    model_file = tmp_path / "hey_friday.onnx"
+    model_file.write_bytes(b"dummy")
+
+    config = VoiceConfig(
+        sample_rate=invalid_rate,
+        wake_word_model_path=str(model_file),
+        wake_word_engine="openwakeword",
+    )
+
+    with pytest.raises(ValueError, match="openWakeWord backend requires sample_rate=16000 Hz"):
+        WakeWordDetector(config=config)
+
+
+def test_custom_backend_allows_non_16khz_sample_rate():
+    """Verify that custom wake_word_engine does not enforce 16 kHz."""
+    config = VoiceConfig(
+        sample_rate=8000,
+        wake_word_engine="custom",
+    )
+    mock_engine = MagicMock(return_value=0.75)
+    detector = WakeWordDetector(config=config, engine=mock_engine)
+    assert detector.is_active is True
+    assert detector.config.sample_rate == 8000
+
+
+def test_existing_vad_audio_config_behavior_remains_unchanged():
+    """
+    Verify that VoiceConfig with 8000, 32000, or 48000 Hz remains valid for
+    VAD, AudioCaptureService, and STT without regression.
+    """
+    for sr in (8000, 16000, 32000, 48000):
+        cfg = VoiceConfig(sample_rate=sr)
+        assert cfg.sample_rate == sr
+        assert cfg.frame_samples == (sr * 20) // 1000
+
+
+# ==============================================================================
+# 13. Elimination of Unsafe TypeError Fallback (Milestone 5.1.4.2)
+# ==============================================================================
+
+def test_type_error_inside_predict_propagates_without_second_call(base_config):
+    """
+    Verify that a TypeError raised inside model's predict() is caught by the
+    detector's normal error-handling path and does NOT cause a second prediction call.
+    """
+    call_count = 0
+
+    def mock_predict(x: np.ndarray):
+        nonlocal call_count
+        call_count += 1
+        raise TypeError("Simulated internal model type error during tensor computation")
+
+    mock_engine = MagicMock()
+    mock_engine.predict.side_effect = mock_predict
+
+    detector = WakeWordDetector(config=base_config, engine=mock_engine)
+
+    frame = b"\x00\x00" * base_config.frame_samples
+    # Feed 3 frames (60ms) -> no inference yet
+    for _ in range(3):
+        res = detector.process_frame(frame)
+        assert res.detected is False
+        assert res.error is None
+    assert call_count == 0
+
+    # 4th frame (80ms reached) -> invokes predict() exactly once
+    res = detector.process_frame(frame)
+    assert res.detected is False
+    assert call_count == 1
+    assert mock_engine.predict.call_count == 1
+    assert res.error is not None
+    assert "TypeError" in res.error
+    assert "Simulated internal model type error during tensor computation" in res.error
+

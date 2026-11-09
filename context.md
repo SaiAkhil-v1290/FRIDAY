@@ -766,16 +766,23 @@ LONG-TERM MEMORY (Local SQLite)
     - Verified all post-wake frames are preserved across handoff and delivered to the pipeline's VAD exactly once and in strict FIFO order.
     - Confirmed the wake frame itself is not reprocessed as command audio.
     - Guaranteed cleanup of both workers in `finally:` blocks even on assertion failure.
+  - **Public Pipeline Lifecycle Contract (`worker_alive`)**:
+    - Added a documented, thread-safe public read-only property `worker_alive: bool` to `VoicePipeline` (`voice/pipeline.py`), reporting whether the background worker thread exists and is alive independently of the `_running` state flag.
+    - Updated `VoiceActivationOrchestrator._is_pipeline_active()` (`voice/activation.py`) to query strictly the documented public `is_running` and `worker_alive` properties, eliminating heuristic probing of private thread attributes (`_worker_thread`, `worker_thread`, `_worker`, `worker`).
+    - Enforced fail-closed behavior: if either lifecycle property cannot be queried reliably, the pipeline is treated as active/unsafe.
+    - Updated `MockVoicePipeline` and test doubles to implement the public `worker_alive` lifecycle contract.
   - **Testing & Verification**:
-    - Added regression tests in `tests/test_voice_activation.py`:
+    - Added regression tests in `tests/test_voice_activation.py` and `tests/test_voice_pipeline.py`:
+      - `test_correct_worker_alive_reporting`
       - `test_voice_pipeline_startup_raises_and_cleanup_raises_fails_closed`
       - `test_voice_pipeline_startup_partially_initializes_worker_fails_closed`
+      - `test_lifecycle_status_query_failure_fails_closed`
       - `test_initial_clear_events_failure_fails_startup_cleanly`
       - `test_per_cycle_clear_events_failure_fails_closed_and_stops_capture`
       - `test_real_voice_pipeline_fifo_handoff_and_frame_preservation`
     - Preserved existing multi-cycle stale-event drainage, shutdown failure, and event ordering tests.
-    - Total voice subsystem tests: 185 passed in 80.02s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`, `test_voice_activation.py`).
-    - Total repository test suite: 452 passed in 168.73s with zero regressions.
+    - Total voice subsystem tests: 187 passed in 93.41s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`, `test_voice_activation.py`).
+    - Total repository test suite: 454 passed in 151.85s with zero regressions.
 
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`

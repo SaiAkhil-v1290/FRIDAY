@@ -346,28 +346,26 @@ class VoiceActivationOrchestrator:
     def _is_pipeline_active(self) -> bool:
         """
         Check whether the voice pipeline is currently active or has an alive worker thread.
-        Inspects the public is_running contract as well as underlying worker status
-        to ensure partial initialization does not leave orphan background workers.
+        Uses exclusively the documented public is_running and worker_alive properties.
+        Fails closed (returns True) if either property cannot be read reliably.
         """
         try:
-            val = getattr(self.voice_pipeline, "is_running", False)
-            if callable(val):
-                val = val()
-            if bool(val):
+            is_running = getattr(self.voice_pipeline, "is_running")
+            if callable(is_running):
+                is_running = is_running()
+            if bool(is_running):
                 return True
-        except Exception:
-            return True
 
-        for attr in ("_worker_thread", "worker_thread", "_worker", "worker"):
-            w = getattr(self.voice_pipeline, attr, None)
-            if w is not None and hasattr(w, "is_alive"):
-                try:
-                    is_alive_fn = getattr(w, "is_alive")
-                    if callable(is_alive_fn) and is_alive_fn():
-                        return True
-                except Exception:
-                    return True
-        return False
+            worker_alive = getattr(self.voice_pipeline, "worker_alive")
+            if callable(worker_alive):
+                worker_alive = worker_alive()
+            return bool(worker_alive)
+        except Exception as exc:
+            logger.warning(
+                "Failed to read pipeline lifecycle properties reliably; failing closed as active: %s",
+                exc,
+            )
+            return True
 
     def read_event(self, timeout: Optional[float] = 0.1) -> Optional[VoiceActivationEvent]:
         """

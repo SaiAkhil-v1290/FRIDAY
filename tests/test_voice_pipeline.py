@@ -265,6 +265,22 @@ def test_correct_running_state_reporting(pipeline_fixture):
     assert pipeline.is_running is False
 
 
+def test_correct_worker_alive_reporting(pipeline_fixture):
+    """Verify worker_alive accurately reflects whether background worker thread is alive."""
+    pipeline, _, _, _ = pipeline_fixture
+
+    assert pipeline.worker_alive is False
+    assert pipeline.is_running is False
+
+    pipeline.start()
+    assert pipeline.worker_alive is True
+    assert pipeline.is_running is True
+
+    pipeline.stop()
+    assert pipeline.worker_alive is False
+    assert pipeline.is_running is False
+
+
 # ==============================================================================
 # 2. Speech Detection & Utterance Completion
 # ==============================================================================

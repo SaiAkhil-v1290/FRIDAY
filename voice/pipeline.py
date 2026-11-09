@@ -117,6 +117,15 @@ class VoicePipeline:
         with self._lifecycle_lock:
             return self._running
 
+    @property
+    def worker_alive(self) -> bool:
+        """
+        Check whether the pipeline's background worker thread exists and is alive.
+        Thread-safe and independent of the _running state.
+        """
+        with self._lifecycle_lock:
+            return self._worker_thread is not None and self._worker_thread.is_alive()
+
     def start(self, clear_capture_buffer: bool = True) -> None:
         """
         Start the voice processing pipeline and background worker.

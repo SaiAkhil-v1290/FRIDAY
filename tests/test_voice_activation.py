@@ -157,7 +157,16 @@ class MockVoicePipeline:
         self.event_queue: queue.Queue[VoicePipelineEvent] = queue.Queue()
         self.on_start_callback = None
         self._worker_thread = None
+        self._custom_worker_alive = None
         self._lock = threading.Lock()
+
+    @property
+    def worker_alive(self) -> bool:
+        if self._custom_worker_alive is not None:
+            return bool(self._custom_worker_alive)
+        if self._worker_thread is not None and hasattr(self._worker_thread, "is_alive"):
+            return bool(self._worker_thread.is_alive())
+        return bool(self.is_running)
 
     def start(self, clear_capture_buffer: bool = True) -> None:
         self.last_clear_capture_buffer = clear_capture_buffer
@@ -871,6 +880,10 @@ def test_voice_pipeline_startup_partially_initializes_worker_fails_closed(base_c
             self._orphan_worker = None
             self._keep_running = True
 
+        @property
+        def worker_alive(self) -> bool:
+            return self._orphan_worker is not None and self._orphan_worker.is_alive()
+
         def start(self, clear_capture_buffer: bool = True):
             self.last_clear_capture_buffer = clear_capture_buffer
             self._orphan_worker = threading.Thread(target=self._worker_run, daemon=True)
@@ -904,6 +917,11 @@ def test_voice_pipeline_startup_partially_initializes_worker_fails_closed(base_c
         assert "VoicePipeline startup failure" in ev.error
         assert "cleanup failed to terminate cleanly" in ev.error
 
+        # Verify that worker_alive was True while is_running was False
+        assert pipeline.worker_alive is True
+        assert pipeline.is_running is False
+        assert orchestrator._is_pipeline_active() is True
+
         deadline = time.time() + 2.0
         while time.time() < deadline:
             if not orchestrator.is_running and not capture.is_running:
@@ -919,6 +937,84 @@ def test_voice_pipeline_startup_partially_initializes_worker_fails_closed(base_c
         pipeline._keep_running = False
         if pipeline._orphan_worker:
             pipeline._orphan_worker.join(timeout=1.0)
+
+
+def test_lifecycle_status_query_failure_fails_closed(base_config):
+    """
+    Verify that if querying either required lifecycle property (is_running or worker_alive)
+    raises an exception, _is_pipeline_active() treats the pipeline as active and fails closed.
+    """
+    capture = MockAudioCaptureService(base_config)
+    detector = MockWakeWordDetector(base_config, available=True)
+
+    class BrokenLifecyclePipeline(MockVoicePipeline):
+        def __init__(self, cfg, cap):
+            super().__init__(cfg, cap)
+            self.raise_on_worker_alive = True
+
+        @property
+        def worker_alive(self) -> bool:
+            if self.raise_on_worker_alive:
+                raise RuntimeError("Hardware bus error reading worker thread state")
+            return False
+
+    pipeline = BrokenLifecyclePipeline(base_config, capture)
+    pipeline.fail_on_start = True
+
+    orchestrator = VoiceActivationOrchestrator(
+        config=base_config,
+        capture_service=capture,
+        wake_word_detector=detector,
+        voice_pipeline=pipeline,
+    )
+
+    # 1. Directly verify _is_pipeline_active fails closed when worker_alive raises
+    assert orchestrator._is_pipeline_active() is True
+
+    # 2. Verify when is_running property raises, it also fails closed
+    class BrokenRunningPipeline(MockVoicePipeline):
+        def __init__(self, cfg, cap):
+            super().__init__(cfg, cap)
+            self._raise_on_running = True
+
+        @property
+        def is_running(self) -> bool:
+            if getattr(self, "_raise_on_running", False):
+                raise RuntimeError("Cannot evaluate is_running")
+            return False
+
+        @is_running.setter
+        def is_running(self, val):
+            pass
+
+    broken_running = BrokenRunningPipeline(base_config, capture)
+    orchestrator_broken_running = VoiceActivationOrchestrator(
+        config=base_config,
+        capture_service=capture,
+        wake_word_detector=detector,
+        voice_pipeline=broken_running,
+    )
+    assert orchestrator_broken_running._is_pipeline_active() is True
+
+    # 3. Integration verification: orchestrator fails closed when lifecycle status fails during startup cleanup
+    orchestrator.start()
+    detector.trigger_on_next_frame(confidence=0.90)
+    capture.feed_frame(b"\x00\x00" * base_config.frame_samples)
+
+    ev = wait_for_event(orchestrator, VoiceActivationEventType.ACTIVATION_ERROR.value)
+    assert "cleanup failed to terminate cleanly" in ev.error
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if not orchestrator.is_running and not capture.is_running:
+            break
+        time.sleep(0.02)
+
+    assert orchestrator.is_running is False
+    assert capture.is_running is False
+
+    with pytest.raises(VoiceActivationError, match="VoicePipeline failed to terminate cleanly"):
+        orchestrator.stop()
 
 
 def test_initial_clear_events_failure_fails_startup_cleanly(base_config):

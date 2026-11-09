@@ -784,6 +784,74 @@ LONG-TERM MEMORY (Local SQLite)
     - Total voice subsystem tests: 187 passed in 93.41s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`, `test_voice_activation.py`).
     - Total repository test suite: 454 passed in 151.85s with zero regressions.
 
+- **Milestone 5.1.6**: Local Piper TTS Foundation:
+  - **Purpose**: Implement a local-only Text-to-Speech (TTS) foundation using Piper TTS (`PiperTTSService` in `voice/tts.py`), converting text into speech and streaming it to the local speaker with bounded audio handling, cooperative cancellation, safe concurrency, and testable interfaces.
+  - **Subsystem Architecture & Components**:
+    - `voice/tts.py`:
+      - `PiperTTSService`: High-level TTS service wrapping local Piper ONNX voices.
+      - Public Interface:
+        - `is_available() -> bool`: Lazily checks Piper dependency and validates model files without raising exceptions.
+        - `speak(text: str, non_blocking: bool = True) -> None`: Synthesizes and plays speech. In non-blocking mode, dispatches to a dedicated daemon worker thread (`PiperTTSWorker-<id>`). In blocking mode, executes synchronously on caller's thread.
+        - `stop() -> None`: Cooperatively cancels active synthesis and playback immediately. Thread-safe and idempotent.
+        - `is_speaking: bool`: Read-only property indicating active speech synthesis or playback.
+        - `last_error: Optional[Exception]`: Most recent runtime exception captured during worker synthesis or playback.
+        - `initialization_error: Optional[str]`: Detailed error explaining why Piper or the configured voice model is unavailable.
+      - Exceptions:
+        - `TTSError`: Base class for TTS errors.
+        - `TTSInitializationError`: Model file missing, JSON malformed, or missing piper package.
+        - `TTSUnavailableError`: Raised when attempting to speak without an available engine/model.
+        - `TTSConfigError`: Raised on empty/whitespace text, oversized text, or invalid config.
+        - `TTSPlaybackError`: Raised on sink write failure or worker timeout during shutdown.
+    - **Dynamic Sample-Rate Output Sink (`voice/audio_io.py`)**:
+      - Extended `AudioOutputSink.open(sample_rate=None, channels=None)` and `SoundDeviceOutputSink` to support dynamic sample rates (e.g. 22050 Hz, 44100 Hz, 16000 Hz) directly from Piper chunk metadata or model settings, eliminating hardcoded 16 kHz capture assumptions.
+    - **VoiceConfig Extensions (`voice/config.py`)**:
+      - `tts_model_path: Optional[str] = None`: Local path to Piper `.onnx` voice model.
+      - `tts_config_path: Optional[str] = None`: Local path to Piper `.onnx.json` model config.
+      - `tts_max_text_length: int = 4000`: Maximum character limit for input text.
+      - `tts_max_audio_duration_seconds: float = 60.0`: Maximum allowed cumulative audio duration per session.
+      - `tts_playback_join_timeout_seconds: float = 1.0`: Timeout when stopping/preempting playback workers.
+      - `tts_volume: float = 1.0`: Output volume multiplier ($\ge 0.0$).
+      - `tts_length_scale: float = 1.0`: Speech rate / length scale ($> 0.0$).
+      - `tts_noise_scale: float = 0.667`: Phoneme noise scale ($0.0 \dots 2.0$).
+      - `tts_noise_w_scale: float = 0.8`: Phoneme width noise scale ($0.0 \dots 2.0$).
+      - Parameter validation enforced in `VoiceConfig.__post_init__`.
+  - **Streaming Synthesis & Bounded Memory**:
+    - Synthesizes audio using Piper's generator interface (`PiperVoice.synthesize(text)`), yielding chunks as they become available.
+    - Chunks are fed directly to `AudioOutputSink.write(data)` sequentially without accumulating the entire audio waveform in memory.
+    - Prevents unbounded generation by accumulating byte count and raising `TTSConfigError` if audio exceeds `tts_max_audio_duration_seconds`.
+  - **Concurrency & Cancellation Safeguards**:
+    - Serialization: Only one speech session plays at a time. Preemptive `speak()` requests cooperatively interrupt and join previous active sessions before beginning new playback.
+    - Safe Stopping: `stop()` sets `session.stop_event`, cancels the sink (`sink.stop()`), and waits for the worker to terminate within `tts_playback_join_timeout_seconds`. Worker joins execute strictly outside `_lifecycle_lock` to prevent deadlocks.
+    - Fail-Closed Uncooperative Worker Handling: If a worker thread fails to join within timeout, `stop()` raises `TTSPlaybackError`.
+    - Thread-Safe Error Reporting: `last_error` and `is_speaking` state updates occur atomically under `_lifecycle_lock`.
+  - **Licensing & Dependencies**:
+    - `piper-tts` is licensed under GPL-3.0-or-later. Voice models carry individual licenses (MIT, Public Domain, ODC-By, etc.).
+    - Created `requirements-tts.txt` isolating `piper-tts>=1.8.0` as an optional dependency so the core FRIDAY system remains clean and importable without TTS installed.
+  - **Testing & Verification**:
+    - `tests/test_voice_tts.py`: 27 comprehensive unit and integration tests covering:
+      - Missing piper package / graceful degradation.
+      - Unconfigured model path, missing files, invalid JSON root structures.
+      - Model loading success, caching, and initialization error logging.
+      - Empty, whitespace, and oversized text validation.
+      - Streaming chunk delivery in order and audio format preservation (22050 Hz, 44100 Hz).
+      - Non-blocking and blocking playback lifecycles.
+      - Cooperative stop during synthesis stream and playback.
+      - Repeated speak and stop cycles.
+      - Preemptive speak canceling previous sessions.
+      - Single-writer sink invariant (no concurrent writes).
+      - Worker synthesis exception capture and blocking re-raise.
+      - Audio duration limit enforcement.
+      - Uncooperative worker timeout detection.
+      - Parameter validation in `VoiceConfig`.
+      - Safe import of `voice` and `main` without Piper installed.
+    - Total voice subsystem tests: 214 passed in 209.93s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`, `test_voice_activation.py`, `test_voice_tts.py`).
+    - Total repository test suite: 481 passed in 147.01s with zero regressions.
+  - **Known Limitations & Phase Boundary**:
+    - `PiperTTSService` is an isolated local speech synthesis foundation.
+    - Integration into the main conversational loop, `JarvisOrchestrator`, or `main.py` is NOT yet wired.
+    - Full-duplex barge-in orchestration (stopping TTS when user speaks or says wake word) is deferred to subsequent milestones.
+    - Milestone 5.1.7 has not been started.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

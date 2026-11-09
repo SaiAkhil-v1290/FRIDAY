@@ -1,0 +1,10 @@
+# Optional Text-to-Speech (TTS) dependencies for JARVIS (Milestone 5.1.6)
+#
+# Licensing notice:
+# - piper-tts (https://github.com/OHF-Voice/piper1-gpl) is licensed under GPL-3.0-or-later.
+# - Piper voice models are trained on distinct datasets and distributed under their own
+#   respective licenses (e.g. MIT, Public Domain, ODC-By, CC-BY).
+#   Always inspect the license field inside each voice model's .onnx.json file.
+#
+piper-tts>=1.8.0
+

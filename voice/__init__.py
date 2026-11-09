@@ -44,6 +44,14 @@ from voice.activation import (
     VoiceActivationEventType,
     VoiceActivationError,
 )
+from voice.tts import (
+    PiperTTSService,
+    TTSError,
+    TTSInitializationError,
+    TTSUnavailableError,
+    TTSConfigError,
+    TTSPlaybackError,
+)
 
 __all__ = [
     "VoiceConfig",
@@ -76,4 +84,10 @@ __all__ = [
     "VoiceActivationEvent",
     "VoiceActivationEventType",
     "VoiceActivationError",
+    "PiperTTSService",
+    "TTSError",
+    "TTSInitializationError",
+    "TTSUnavailableError",
+    "TTSConfigError",
+    "TTSPlaybackError",
 ]

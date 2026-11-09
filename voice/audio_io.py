@@ -79,7 +79,7 @@ class AudioOutputSink(ABC):
     """Abstract base class for audio playback sinks."""
 
     @abstractmethod
-    def open(self) -> None:
+    def open(self, sample_rate: int | None = None, channels: int | None = None) -> None:
         """Open and prepare the output playback stream."""
         pass
 
@@ -207,16 +207,32 @@ class SoundDeviceOutputSink(AudioOutputSink):
     Default speaker playback backend using python-sounddevice.
     Hardened to ensure cancelled streams are completely closed and released,
     guaranteeing reliable reinitialization on subsequent playback cycles.
+    Supports dynamic sample rates (e.g. For TTS output).
     """
 
-    def __init__(self, config: VoiceConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: VoiceConfig | None = None,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> None:
         self.config = config or default_voice_config
+        self.sample_rate = sample_rate or (self.config.sample_rate if self.config else 16000)
+        self.channels = channels or (self.config.channels if self.config else 1)
         self._stream = None
         self._active = False
 
-    def open(self) -> None:
+    def open(self, sample_rate: int | None = None, channels: int | None = None) -> None:
+        target_rate = sample_rate or self.sample_rate
+        target_channels = channels or self.channels
+
         if self._active and self._stream is not None:
-            return
+            if self.sample_rate == target_rate and self.channels == target_channels:
+                return
+            self.close()
+
+        self.sample_rate = target_rate
+        self.channels = target_channels
 
         # Clean up any stale or aborted stream
         if self._stream is not None:
@@ -251,8 +267,8 @@ class SoundDeviceOutputSink(AudioOutputSink):
                     raise AudioDeviceError("No speaker or audio output device found.")
 
             self._stream = sd.RawOutputStream(
-                samplerate=self.config.sample_rate,
-                channels=self.config.channels,
+                samplerate=self.sample_rate,
+                channels=self.channels,
                 dtype="int16",
                 device=default_out,
             )

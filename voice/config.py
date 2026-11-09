@@ -47,6 +47,15 @@ class VoiceConfig:
     activation_frame_read_timeout_seconds: float = 0.1
     activation_pipeline_event_timeout_seconds: float = 0.1
     activation_join_timeout_seconds: float = 2.0
+    tts_model_path: str | None = None
+    tts_config_path: str | None = None
+    tts_max_text_length: int = 1000
+    tts_max_audio_duration_seconds: float = 60.0
+    tts_playback_join_timeout_seconds: float = 2.0
+    tts_volume: float = 1.0
+    tts_length_scale: float = 1.0
+    tts_noise_scale: float = 0.667
+    tts_noise_w_scale: float = 0.8
 
     def __post_init__(self) -> None:
         if self.sample_rate not in (8000, 16000, 32000, 48000):
@@ -117,6 +126,24 @@ class VoiceConfig:
             raise ValueError("activation_pipeline_event_timeout_seconds must be positive.")
         if self.activation_join_timeout_seconds <= 0:
             raise ValueError("activation_join_timeout_seconds must be positive.")
+        if self.tts_model_path is not None and not self.tts_model_path.strip():
+            raise ValueError("tts_model_path cannot be empty.")
+        if self.tts_config_path is not None and not self.tts_config_path.strip():
+            raise ValueError("tts_config_path cannot be empty.")
+        if self.tts_max_text_length <= 0:
+            raise ValueError("tts_max_text_length must be positive.")
+        if self.tts_max_audio_duration_seconds <= 0:
+            raise ValueError("tts_max_audio_duration_seconds must be positive.")
+        if self.tts_playback_join_timeout_seconds <= 0:
+            raise ValueError("tts_playback_join_timeout_seconds must be positive.")
+        if self.tts_volume <= 0.0:
+            raise ValueError("tts_volume must be positive.")
+        if self.tts_length_scale <= 0.0:
+            raise ValueError("tts_length_scale must be positive.")
+        if self.tts_noise_scale < 0.0:
+            raise ValueError("tts_noise_scale cannot be negative.")
+        if self.tts_noise_w_scale < 0.0:
+            raise ValueError("tts_noise_w_scale cannot be negative.")
 
     @property
     def bytes_per_sample(self) -> int:

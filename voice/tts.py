@@ -436,42 +436,53 @@ class PiperTTSService:
                     break
 
                 # 1. Extract audio data bytes
-                audio_data = getattr(chunk, "audio_int16_bytes", None) or getattr(chunk, "audio_bytes", None)
-                if audio_data is None:
-                    if isinstance(chunk, (bytes, bytearray)):
-                        audio_data = bytes(chunk)
-                    else:
-                        audio_data = bytes(chunk)
+                raw_audio = getattr(chunk, "audio_int16_bytes", None)
+                if raw_audio is None:
+                    raw_audio = getattr(chunk, "audio_bytes", None)
 
-                if not isinstance(audio_data, (bytes, bytearray, memoryview)):
-                    raise TTSConfigError(f"Piper audio chunk data must be bytes, got {type(audio_data).__name__}.")
+                if raw_audio is not None:
+                    if not isinstance(raw_audio, (bytes, bytearray, memoryview)):
+                        raise TTSConfigError(
+                            f"Piper audio chunk field must contain bytes-like data, got {type(raw_audio).__name__}."
+                        )
+                    audio_data = bytes(raw_audio)
+                elif isinstance(chunk, (bytes, bytearray, memoryview)):
+                    audio_data = bytes(chunk)
+                else:
+                    raise TTSConfigError(
+                        f"Unsupported Piper chunk payload type {type(chunk).__name__}: "
+                        f"expected chunk with audio_int16_bytes or bytes-like object."
+                    )
 
                 if len(audio_data) == 0:
                     continue
 
-                # 2. Extract and validate sample rate (positive integer)
+                # 2. Extract and strictly validate sample rate (exact positive int)
                 raw_sample_rate = getattr(chunk, "sample_rate", None)
                 if raw_sample_rate is None:
                     raw_sample_rate = getattr(voice, "sample_rate", 22050)
-                if not isinstance(raw_sample_rate, int) or raw_sample_rate <= 0:
+                if type(raw_sample_rate) is not int or raw_sample_rate <= 0:
                     raise TTSConfigError(
-                        f"Invalid sample rate {raw_sample_rate}: sample_rate must be a positive integer."
+                        f"Invalid sample rate {raw_sample_rate} (type={type(raw_sample_rate).__name__}): "
+                        f"sample_rate must be an exact positive integer."
                     )
                 sample_rate: int = raw_sample_rate
 
-                # 3. Extract and validate sample width (exactly 2 bytes for int16 backend)
+                # 3. Extract and strictly validate sample width (exact int, exactly 2)
                 raw_sample_width = getattr(chunk, "sample_width", 2)
-                if raw_sample_width != 2:
+                if type(raw_sample_width) is not int or raw_sample_width != 2:
                     raise TTSConfigError(
-                        f"Unsupported sample width {raw_sample_width}: only 16-bit (2 bytes per sample) is supported."
+                        f"Unsupported sample width {raw_sample_width} (type={type(raw_sample_width).__name__}): "
+                        f"only 16-bit (2 bytes per sample as exact int) is supported."
                     )
                 sample_width: int = raw_sample_width
 
-                # 4. Extract and validate channel count (mono only = 1)
+                # 4. Extract and strictly validate channel count (exact int, mono only = 1)
                 raw_channels = getattr(chunk, "sample_channels", 1)
-                if raw_channels != 1:
+                if type(raw_channels) is not int or raw_channels != 1:
                     raise TTSConfigError(
-                        f"Unsupported channel count {raw_channels}: only mono (1 channel) is supported."
+                        f"Unsupported channel count {raw_channels} (type={type(raw_channels).__name__}): "
+                        f"only mono (1 channel as exact int) is supported."
                     )
                 channels: int = raw_channels
 
@@ -506,10 +517,7 @@ class PiperTTSService:
 
                 # 8. Open sink with validated audio format
                 if not sink_opened or not self.sink.is_active:
-                    try:
-                        self.sink.open(sample_rate=sample_rate, channels=channels)
-                    except TypeError:
-                        self.sink.open()
+                    self.sink.open(sample_rate=sample_rate, channels=channels)
                     sink_opened = True
 
                 # 9. Write chunk to output sink

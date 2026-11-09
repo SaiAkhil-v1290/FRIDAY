@@ -216,9 +216,11 @@ class SoundDeviceOutputSink(AudioOutputSink):
         sample_rate: int | None = None,
         channels: int | None = None,
     ) -> None:
-        self.config = config or default_voice_config
-        self.sample_rate = sample_rate or (self.config.sample_rate if self.config else 16000)
-        self.channels = channels or (self.config.channels if self.config else 1)
+        self.config = default_voice_config if config is None else config
+        default_rate = self.config.sample_rate if self.config is not None else 16000
+        default_channels = self.config.channels if self.config is not None else 1
+        self.sample_rate = default_rate if sample_rate is None else sample_rate
+        self.channels = default_channels if channels is None else channels
         self._stream = None
         self._active = False
 
@@ -226,10 +228,10 @@ class SoundDeviceOutputSink(AudioOutputSink):
         target_rate = self.sample_rate if sample_rate is None else sample_rate
         target_channels = self.channels if channels is None else channels
 
-        if not isinstance(target_rate, int) or target_rate <= 0:
-            raise AudioDeviceError(f"Invalid output sample rate {target_rate}: must be a positive integer.")
-        if target_channels != 1:
-            raise AudioDeviceError(f"Unsupported output channel count {target_channels}: only mono (1 channel) is supported.")
+        if type(target_rate) is not int or target_rate <= 0:
+            raise AudioDeviceError(f"Invalid output sample rate {target_rate}: must be an exact positive integer.")
+        if type(target_channels) is not int or target_channels != 1:
+            raise AudioDeviceError(f"Unsupported output channel count {target_channels}: only mono (1 channel as int) is supported.")
 
         if self._active and self._stream is not None:
             if self.sample_rate == target_rate and self.channels == target_channels:

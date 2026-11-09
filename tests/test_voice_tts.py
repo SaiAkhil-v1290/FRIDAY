@@ -840,7 +840,7 @@ def test_thread_start_failure_leaves_no_stale_session(base_tts_config):
 # =============================================================================
 
 def test_invalid_sample_rate_rejected(base_tts_config):
-    """Verify non-positive or non-integer sample rates raise TTSConfigError."""
+    """Verify non-positive, boolean, float or non-integer sample rates raise TTSConfigError."""
     # Zero sample rate
     zero_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_rate=0)
     service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[zero_chunk]))
@@ -853,21 +853,59 @@ def test_invalid_sample_rate_rejected(base_tts_config):
     with pytest.raises(TTSConfigError, match="Invalid sample rate -22050"):
         service.speak("Bad sample rate", non_blocking=False)
 
+    # Boolean sample rate
+    bool_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_rate=True)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[bool_chunk]))
+    with pytest.raises(TTSConfigError, match="sample_rate must be an exact positive integer"):
+        service.speak("Bad sample rate", non_blocking=False)
+
+    # Floating point sample rate
+    float_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_rate=22050.0)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[float_chunk]))
+    with pytest.raises(TTSConfigError, match="sample_rate must be an exact positive integer"):
+        service.speak("Bad sample rate", non_blocking=False)
+
 
 def test_unsupported_sample_width_rejected(base_tts_config):
-    """Verify non-16-bit sample widths raise TTSConfigError."""
+    """Verify non-16-bit, boolean, or float sample widths raise TTSConfigError."""
+    # Non-2 width
     bad_width_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_width=1)
     service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[bad_width_chunk]))
     with pytest.raises(TTSConfigError, match="Unsupported sample width 1"):
         service.speak("Bad width", non_blocking=False)
 
+    # Boolean width (isinstance(True, int) is True)
+    bool_width_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_width=True)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[bool_width_chunk]))
+    with pytest.raises(TTSConfigError, match="only 16-bit .* as exact int"):
+        service.speak("Bad width", non_blocking=False)
+
+    # Float width
+    float_width_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_width=2.0)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[float_width_chunk]))
+    with pytest.raises(TTSConfigError, match="only 16-bit .* as exact int"):
+        service.speak("Bad width", non_blocking=False)
+
 
 def test_unsupported_channel_count_rejected(base_tts_config):
-    """Verify multi-channel or zero-channel audio raises TTSConfigError."""
+    """Verify multi-channel, zero-channel, boolean, or float channels raise TTSConfigError."""
+    # Stereo
     stereo_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_channels=2)
     service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[stereo_chunk]))
     with pytest.raises(TTSConfigError, match="Unsupported channel count 2"):
         service.speak("Stereo rejected", non_blocking=False)
+
+    # Boolean channel (isinstance(True, int) is True and True == 1)
+    bool_channel_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_channels=True)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[bool_channel_chunk]))
+    with pytest.raises(TTSConfigError, match="only mono .* as exact int"):
+        service.speak("Bool channel rejected", non_blocking=False)
+
+    # Float channel (1.0 == 1)
+    float_channel_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_channels=1.0)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[float_channel_chunk]))
+    with pytest.raises(TTSConfigError, match="only mono .* as exact int"):
+        service.speak("Float channel rejected", non_blocking=False)
 
 
 def test_misaligned_pcm_byte_length_rejected(base_tts_config):
@@ -889,20 +927,92 @@ def test_format_change_between_consecutive_chunks_rejected(base_tts_config):
 
 
 def test_sounddevice_sink_validates_audio_format():
-    """Verify SoundDeviceOutputSink rejects invalid sample rates, channels, and misaligned bytes."""
+    """Verify SoundDeviceOutputSink rejects invalid sample rates, channels, and types."""
     sink = SoundDeviceOutputSink()
 
     # Invalid sample rate
     with pytest.raises(AudioDeviceError, match="Invalid output sample rate 0"):
         sink.open(sample_rate=0)
 
-    # Invalid channels
+    # Boolean sample rate (True evaluates to 1, but must be rejected)
+    with pytest.raises(AudioDeviceError, match="Invalid output sample rate True"):
+        sink.open(sample_rate=True)
+
+    # Float sample rate
+    with pytest.raises(AudioDeviceError, match="Invalid output sample rate 22050.0"):
+        sink.open(sample_rate=22050.0)
+
+    # Invalid channels (multi-channel)
     with pytest.raises(AudioDeviceError, match="Unsupported output channel count 2"):
         sink.open(channels=2)
+
+    # Boolean channels (True evaluates to 1, but must be rejected)
+    with pytest.raises(AudioDeviceError, match="Unsupported output channel count True"):
+        sink.open(channels=True)
+
+    # Float channels
+    with pytest.raises(AudioDeviceError, match="Unsupported output channel count 1.0"):
+        sink.open(channels=1.0)
+
+    # String channels
+    with pytest.raises(AudioDeviceError, match="Unsupported output channel count mono"):
+        sink.open(channels="mono")
 
     # Inactive write
     with pytest.raises(AudioWriteError, match="Cannot write to closed or inactive"):
         sink.write(b"DATA")
+
+
+def test_parameterized_sink_open_type_error_is_not_retried(base_tts_config):
+    """Verify TypeError from parameterized sink.open() is not caught and retried parameterless."""
+    class StrictParamSink(MockAudioOutputSink):
+        def __init__(self):
+            super().__init__()
+            self.parameterless_open_called = False
+
+        def open(self, sample_rate: int | None = None, channels: int | None = None) -> None:
+            if sample_rate is not None or channels is not None:
+                raise TypeError("Simulated sink signature failure on parameterized open")
+            self.parameterless_open_called = True
+
+    strict_sink = StrictParamSink()
+    mock_voice = MockPiperVoice()
+    service = PiperTTSService(config=base_tts_config, sink=strict_sink, voice=mock_voice)
+
+    with pytest.raises(TypeError, match="Simulated sink signature failure on parameterized open"):
+        service.speak("Should fail without fallback retry", non_blocking=False)
+
+    assert strict_sink.parameterless_open_called is False
+
+
+def test_malformed_audio_chunk_payload_rejected(base_tts_config):
+    """Verify non-bytes audio fields or unsupported chunk payloads raise TTSConfigError."""
+    # Chunk with int in audio_int16_bytes
+    class BadAudioFieldChunk:
+        audio_int16_bytes = 12345
+        sample_rate = 22050
+        sample_width = 2
+        sample_channels = 1
+
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[BadAudioFieldChunk()]))
+    with pytest.raises(TTSConfigError, match="Piper audio chunk field must contain bytes-like data"):
+        service.speak("Bad audio field", non_blocking=False)
+
+    # Arbitrary object as chunk
+    service2 = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[{"not": "a chunk"}]))
+    with pytest.raises(TTSConfigError, match="Unsupported Piper chunk payload type"):
+        service2.speak("Bad chunk object", non_blocking=False)
+
+
+def test_empty_audio_chunk_behavior(base_tts_config):
+    """Verify empty audio chunks are safely skipped without error or bogus writes."""
+    empty_chunk = MockPiperChunk(audio_int16_bytes=b"")
+    valid_chunk = MockPiperChunk(audio_int16_bytes=b"VALID_01")
+    mock_sink = MockAudioOutputSink()
+    service = PiperTTSService(config=base_tts_config, sink=mock_sink, voice=MockPiperVoice(chunks=[empty_chunk, valid_chunk]))
+
+    service.speak("Test empty chunk skipping", non_blocking=False)
+    assert mock_sink.written_chunks == [b"VALID_01"]
 
 
 def test_synthesis_config_construction_failure_surfaced(base_tts_config):

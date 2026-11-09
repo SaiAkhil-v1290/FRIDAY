@@ -896,6 +896,25 @@ LONG-TERM MEMORY (Local SQLite)
       - `test_synthesis_config_construction_failure_surfaced`: Tests config errors are surfaced as `TTSConfigError`.
     - Total voice subsystem tests: 227 passed in 152.10s.
     - Total repository test suite: 494 passed in 239.78s with zero regressions.
+  - **Milestone 5.1.6.2**: Final Piper Audio Format Contract Fix:
+    - **Removed Unsafe Parameterless Sink Fallback**:
+      - In `voice/tts.py`, removed the `try: self.sink.open(sample_rate, channels) except TypeError: self.sink.open()` fallback.
+      - Genuine sink initialization errors are propagated directly, preventing silent fallback to default sink sample rates and channel settings.
+    - **Exact Integer PCM Metadata Validation**:
+      - Enforced strict `type(v) is int` validation across all three metadata fields (`sample_rate`, `sample_width`, `channels`) in `voice/tts.py` and `voice/audio_io.py`.
+      - Rejects `bool` (`True`, `False`) and `float` (`22050.0`, `2.0`, `1.0`), preventing truthiness and numeric equality loopholes.
+      - `SoundDeviceOutputSink.__init__`: Replaced truthiness-based defaults (`sample_rate or default`) with explicit `None` checks (`sample_rate is None`), preventing invalid or falsy inputs from being silently converted to defaults.
+    - **Strict Audio Chunk Extraction**:
+      - Validates official Piper `audio_int16_bytes` using explicit `None` checks, preserving valid empty-chunk handling (`b""`) without falling through to truthiness defaults.
+      - Enforces bytes-like type validation on chunk payloads and strictly rejects arbitrary object payloads (`int`, `dict`, etc.) with `TTSConfigError` rather than attempting unsafe `bytes(chunk)` conversion.
+    - **Testing & Verification**:
+      - `tests/test_voice_tts.py`: Expanded to 43 comprehensive tests (+3 new tests):
+        - `test_parameterized_sink_open_type_error_is_not_retried`: Verifies `TypeError` from parameterized `open()` is not caught and retried parameterless.
+        - `test_malformed_audio_chunk_payload_rejected`: Verifies non-bytes audio fields and unsupported chunk payloads raise `TTSConfigError`.
+        - `test_empty_audio_chunk_behavior`: Verifies empty audio chunks (`b""`) are skipped without error or bogus sink writes.
+        - Strict boolean and float rejection tests for sample rate, sample width, and channel count in `PiperTTSService` and `SoundDeviceOutputSink`.
+      - Total voice subsystem tests: 230 passed in 126.33s.
+      - Total repository test suite: 497 passed in 156.49s with zero regressions.
   - **Known Limitations & Phase Boundary**:
     - Isolated to local Piper TTS foundation and audio output sink.
     - No integration into main conversational loop or `main.py`.

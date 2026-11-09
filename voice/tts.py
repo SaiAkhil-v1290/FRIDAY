@@ -60,6 +60,7 @@ class _TTSSession:
     worker_thread: Optional[threading.Thread] = None
     error: Optional[Exception] = None
     cancelled: bool = False
+    is_blocking: bool = False
 
 
 # =============================================================================
@@ -102,7 +103,16 @@ class PiperTTSService:
         self._initialization_error: Optional[str] = None
         self._last_error: Optional[Exception] = None
 
-        # Playback session state and synchronization
+        # Request and lifecycle synchronization
+        # Lock hierarchy and ordering:
+        # 1. _request_lock (RLock): Serializes request admission, preemption, worker termination,
+        #    and new session registration. Held during stop() and the admission phase of speak().
+        # 2. _lifecycle_lock (Lock): Protects session state variables (_current_session, _is_speaking).
+        # Rule: A caller may acquire _request_lock first, and then _lifecycle_lock within it.
+        # A thread holding _lifecycle_lock must NEVER attempt to acquire _request_lock.
+        # Worker thread joins and event waits must execute strictly outside _lifecycle_lock.
+        # The background worker thread (_run_session) only acquires _lifecycle_lock, never _request_lock.
+        self._request_lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
         self._current_session: Optional[_TTSSession] = None
         self._session_counter: int = 0
@@ -117,7 +127,8 @@ class PiperTTSService:
     @property
     def last_error(self) -> Optional[Exception]:
         """Return the most recent exception encountered during synthesis or playback."""
-        return self._last_error
+        with self._lifecycle_lock:
+            return self._last_error
 
     @property
     def initialization_error(self) -> Optional[str]:
@@ -170,98 +181,132 @@ class PiperTTSService:
             err_msg = self._initialization_error or "Piper TTS service or voice model is unavailable."
             raise TTSUnavailableError(err_msg)
 
-        # 3. Coordinate session serialization under lifecycle lock
-        worker_to_join: Optional[threading.Thread] = None
-        prior_session_to_abort: Optional[_TTSSession] = None
+        # 3. Synchronize request admission and session preemption under _request_lock
+        with self._request_lock:
+            prior_session_to_abort: Optional[_TTSSession] = None
+            worker_to_join: Optional[threading.Thread] = None
 
-        with self._lifecycle_lock:
-            # Check if there is an active session
-            if self._current_session is not None and not self._current_session.done_event.is_set():
-                prior_session_to_abort = self._current_session
-                prior_session_to_abort.stop_event.set()
-                prior_session_to_abort.cancelled = True
-                try:
-                    self.sink.stop()
-                except Exception as e:
-                    logger.debug("Error stopping sink to preempt prior session: %s", e)
-                worker_to_join = prior_session_to_abort.worker_thread
+            with self._lifecycle_lock:
+                if self._current_session is not None and not self._current_session.done_event.is_set():
+                    prior_session_to_abort = self._current_session
+                    prior_session_to_abort.stop_event.set()
+                    prior_session_to_abort.cancelled = True
+                    try:
+                        self.sink.stop()
+                    except Exception as e:
+                        logger.debug("Error stopping sink to preempt prior session: %s", e)
+                    worker_to_join = prior_session_to_abort.worker_thread
 
-        # Join prior worker OUTSIDE lifecycle lock to avoid deadlock
-        if worker_to_join is not None and worker_to_join is not threading.current_thread():
-            if worker_to_join.is_alive():
-                worker_to_join.join(timeout=self.config.tts_playback_join_timeout_seconds)
-                if worker_to_join.is_alive():
-                    # Prior session refused to stop!
-                    raise TTSPlaybackError(
-                        "Cannot start speech playback: previous session failed to terminate within timeout."
-                    )
+            # Wait for prior worker to terminate outside _lifecycle_lock, inside _request_lock
+            if prior_session_to_abort is not None:
+                if not prior_session_to_abort.is_blocking and worker_to_join is not None:
+                    if worker_to_join is not threading.current_thread() and worker_to_join.is_alive():
+                        worker_to_join.join(timeout=self.config.tts_playback_join_timeout_seconds)
+                        if worker_to_join.is_alive():
+                            # Uncooperative worker timeout: preserve worker reference, do not clear session
+                            raise TTSPlaybackError(
+                                "Cannot start speech playback: previous session failed to terminate within timeout."
+                            )
+                else:
+                    if worker_to_join is not threading.current_thread():
+                        joined = prior_session_to_abort.done_event.wait(
+                            timeout=self.config.tts_playback_join_timeout_seconds
+                        )
+                        if not joined:
+                            raise TTSPlaybackError(
+                                "Cannot start speech playback: previous blocking session failed to terminate within timeout."
+                            )
 
-        # 4. Start new session under lifecycle lock
-        with self._lifecycle_lock:
-            self._session_counter += 1
-            session = _TTSSession(
-                session_id=self._session_counter,
-                text=clean_text,
-            )
-            self._current_session = session
-            self._is_speaking = True
-            self._last_error = None
-
-            if non_blocking:
-                worker = threading.Thread(
-                    target=self._run_session,
-                    args=(session,),
-                    name=f"PiperTTSWorker-{session.session_id}",
-                    daemon=True,
+            # 4. Register new session under _lifecycle_lock
+            with self._lifecycle_lock:
+                self._session_counter += 1
+                session = _TTSSession(
+                    session_id=self._session_counter,
+                    text=clean_text,
+                    is_blocking=not non_blocking,
                 )
-                session.worker_thread = worker
-                worker.start()
-                return
+                self._current_session = session
+                self._is_speaking = True
+                self._last_error = None
 
-        # Blocking execution runs on calling thread
-        session.worker_thread = threading.current_thread()
+                if non_blocking:
+                    worker = threading.Thread(
+                        target=self._run_session,
+                        args=(session,),
+                        name=f"PiperTTSWorker-{session.session_id}",
+                        daemon=True,
+                    )
+                    session.worker_thread = worker
+                    try:
+                        worker.start()
+                    except Exception as start_exc:
+                        # Handle thread start failure without leaving stale active session state
+                        if self._current_session is session:
+                            self._current_session = None
+                            self._is_speaking = False
+                        session.done_event.set()
+                        session.error = start_exc
+                        self._last_error = start_exc
+                        raise TTSPlaybackError(f"Failed to start TTS worker thread: {start_exc}") from start_exc
+                    return
+
+                # For blocking execution: record current thread as worker thread
+                session.worker_thread = threading.current_thread()
+
+        # 5. Blocking execution runs outside _request_lock so stop() can cancel it
         self._run_session(session)
-        if session.error is not None:
+        if session.error is not None and not session.cancelled:
             raise session.error
 
     def stop(self) -> None:
         """
         Immediately interrupt and cancel any active speech synthesis and playback.
-        Thread-safe and idempotent.
+        Thread-safe and idempotent. Coordinated with session creation via _request_lock.
         """
-        worker_to_join: Optional[threading.Thread] = None
-        session: Optional[_TTSSession] = None
+        with self._request_lock:
+            worker_to_join: Optional[threading.Thread] = None
+            session: Optional[_TTSSession] = None
 
-        with self._lifecycle_lock:
-            if self._current_session is None or self._current_session.done_event.is_set():
-                self._is_speaking = False
-                return
+            with self._lifecycle_lock:
+                if self._current_session is None or self._current_session.done_event.is_set():
+                    self._is_speaking = False
+                    return
 
-            session = self._current_session
-            session.stop_event.set()
-            session.cancelled = True
+                session = self._current_session
+                session.stop_event.set()
+                session.cancelled = True
 
-            try:
-                self.sink.stop()
-            except Exception as e:
-                logger.debug("Error stopping audio sink during TTS stop: %s", e)
+                try:
+                    self.sink.stop()
+                except Exception as e:
+                    logger.debug("Error stopping audio sink during TTS stop: %s", e)
 
-            worker_to_join = session.worker_thread
+                worker_to_join = session.worker_thread
 
-        # Wait for worker outside lock
-        if worker_to_join is not None and worker_to_join is not threading.current_thread():
-            if worker_to_join.is_alive():
-                worker_to_join.join(timeout=self.config.tts_playback_join_timeout_seconds)
-                if worker_to_join.is_alive():
-                    raise TTSPlaybackError(
-                        f"TTS worker thread {worker_to_join.name} failed to terminate within "
-                        f"{self.config.tts_playback_join_timeout_seconds}s timeout."
-                    )
+            # Wait for worker outside _lifecycle_lock, inside _request_lock
+            if not session.is_blocking and worker_to_join is not None:
+                if worker_to_join is not threading.current_thread() and worker_to_join.is_alive():
+                    worker_to_join.join(timeout=self.config.tts_playback_join_timeout_seconds)
+                    if worker_to_join.is_alive():
+                        # Uncooperative worker timeout: preserve worker reference, do not clear session
+                        raise TTSPlaybackError(
+                            f"TTS worker thread {worker_to_join.name} failed to terminate within "
+                            f"{self.config.tts_playback_join_timeout_seconds}s timeout."
+                        )
+            else:
+                if worker_to_join is not threading.current_thread():
+                    joined = session.done_event.wait(timeout=self.config.tts_playback_join_timeout_seconds)
+                    if not joined:
+                        name = worker_to_join.name if worker_to_join else "blocking-worker"
+                        raise TTSPlaybackError(
+                            f"TTS session {session.session_id} on thread {name} failed to terminate within "
+                            f"{self.config.tts_playback_join_timeout_seconds}s timeout."
+                        )
 
-        with self._lifecycle_lock:
-            if self._current_session is session:
-                self._current_session = None
-                self._is_speaking = False
+            with self._lifecycle_lock:
+                if self._current_session is session:
+                    self._current_session = None
+                    self._is_speaking = False
 
     def _ensure_model_loaded(self) -> Optional[Any]:
         """
@@ -329,70 +374,60 @@ class PiperTTSService:
                 return None
 
     def _build_synthesis_config(self) -> Optional[Any]:
-        """Build Piper SynthesisConfig parameters from VoiceConfig if piper is installed."""
+        """
+        Build Piper SynthesisConfig parameters from VoiceConfig.
+
+        Raises:
+            TTSUnavailableError: If piper is not installed and no injected voice override is active.
+            TTSConfigError: If SynthesisConfig construction fails or parameters are invalid.
+        """
         try:
             from piper import SynthesisConfig
+        except ImportError:
+            # Piper is not installed; permitted only when using an injected test voice override
+            if self._voice_override is not None:
+                return None
+            raise TTSUnavailableError("The 'piper' package is required for synthesis configuration.")
+
+        try:
             return SynthesisConfig(
                 volume=self.config.tts_volume,
                 length_scale=self.config.tts_length_scale,
                 noise_scale=self.config.tts_noise_scale,
                 noise_w_scale=self.config.tts_noise_w_scale,
             )
-        except Exception:
-            return None
+        except Exception as exc:
+            raise TTSConfigError(f"Failed to construct Piper synthesis configuration: {exc}") from exc
 
     def _synthesize_stream(self, voice: Any, text: str, syn_config: Optional[Any] = None) -> Iterator[Any]:
         """
-        Invoke Piper's streaming synthesis generator.
-        Falls back to in-memory synthesize_wav if synthesize is not implemented on mock.
+        Invoke Piper's official streaming synthesis generator.
+
+        Production streaming interface:
+            voice.synthesize(text, syn_config=syn_config)
+
+        Raises:
+            TTSUnavailableError: If voice model lacks the streaming synthesize() method.
+            Exception: Any genuine synthesis exception is propagated without masking.
         """
-        if hasattr(voice, "synthesize"):
-            try:
-                if syn_config is not None:
-                    return voice.synthesize(text, syn_config=syn_config)
-                return voice.synthesize(text)
-            except TypeError:
-                return voice.synthesize(text)
-        elif hasattr(voice, "synthesize_wav"):
-            import io
-            import wave
-            buf = io.BytesIO()
-            with wave.open(buf, "wb") as wav_out:
-                if syn_config is not None:
-                    try:
-                        voice.synthesize_wav(text, wav_out, syn_config=syn_config)
-                    except TypeError:
-                        voice.synthesize_wav(text, wav_out)
-                else:
-                    voice.synthesize_wav(text, wav_out)
-            buf.seek(0)
-            with wave.open(buf, "rb") as wav_in:
-                rate = wav_in.getframerate()
-                width = wav_in.getsampwidth()
-                channels = wav_in.getnchannels()
-                pcm = wav_in.readframes(wav_in.getnframes())
+        if not hasattr(voice, "synthesize") or not callable(getattr(voice, "synthesize")):
+            raise TTSUnavailableError("Voice model does not support the official streaming synthesize() interface.")
 
-            @dataclass
-            class _SyntheticChunk:
-                audio_int16_bytes: bytes
-                sample_rate: int
-                sample_width: int
-                sample_channels: int
-
-            return iter([_SyntheticChunk(pcm, rate, width, channels)])
-        else:
-            raise TTSError("Voice model does not support synthesize or synthesize_wav.")
+        if syn_config is not None:
+            return voice.synthesize(text, syn_config=syn_config)
+        return voice.synthesize(text)
 
     def _run_session(self, session: _TTSSession) -> None:
         """Sequential synthesis and playback worker routine."""
         sink_opened = False
+        initial_format: Optional[Tuple[int, int, int]] = None
+        total_bytes = 0
+        bytes_per_second: Optional[int] = None
+        max_bytes: Optional[int] = None
+
         try:
             voice = self._model
             syn_config = self._build_synthesis_config()
-
-            total_bytes = 0
-            bytes_per_second: Optional[int] = None
-            max_bytes: Optional[int] = None
 
             for chunk in self._synthesize_stream(voice, session.text, syn_config):
                 # Cooperative cancellation check
@@ -400,24 +435,68 @@ class PiperTTSService:
                     session.cancelled = True
                     break
 
+                # 1. Extract audio data bytes
                 audio_data = getattr(chunk, "audio_int16_bytes", None) or getattr(chunk, "audio_bytes", None)
                 if audio_data is None:
-                    if isinstance(chunk, bytes):
-                        audio_data = chunk
+                    if isinstance(chunk, (bytes, bytearray)):
+                        audio_data = bytes(chunk)
                     else:
                         audio_data = bytes(chunk)
 
-                if not audio_data:
+                if not isinstance(audio_data, (bytes, bytearray, memoryview)):
+                    raise TTSConfigError(f"Piper audio chunk data must be bytes, got {type(audio_data).__name__}.")
+
+                if len(audio_data) == 0:
                     continue
 
-                sample_rate = getattr(chunk, "sample_rate", None) or getattr(voice, "sample_rate", 22050)
-                sample_width = getattr(chunk, "sample_width", 2)
-                channels = getattr(chunk, "sample_channels", 1)
+                # 2. Extract and validate sample rate (positive integer)
+                raw_sample_rate = getattr(chunk, "sample_rate", None)
+                if raw_sample_rate is None:
+                    raw_sample_rate = getattr(voice, "sample_rate", 22050)
+                if not isinstance(raw_sample_rate, int) or raw_sample_rate <= 0:
+                    raise TTSConfigError(
+                        f"Invalid sample rate {raw_sample_rate}: sample_rate must be a positive integer."
+                    )
+                sample_rate: int = raw_sample_rate
 
-                if bytes_per_second is None:
-                    bytes_per_second = sample_rate * sample_width * channels
+                # 3. Extract and validate sample width (exactly 2 bytes for int16 backend)
+                raw_sample_width = getattr(chunk, "sample_width", 2)
+                if raw_sample_width != 2:
+                    raise TTSConfigError(
+                        f"Unsupported sample width {raw_sample_width}: only 16-bit (2 bytes per sample) is supported."
+                    )
+                sample_width: int = raw_sample_width
+
+                # 4. Extract and validate channel count (mono only = 1)
+                raw_channels = getattr(chunk, "sample_channels", 1)
+                if raw_channels != 1:
+                    raise TTSConfigError(
+                        f"Unsupported channel count {raw_channels}: only mono (1 channel) is supported."
+                    )
+                channels: int = raw_channels
+
+                # 5. Validate PCM byte length alignment: must be multiple of (sample_width * channels)
+                bytes_per_frame = sample_width * channels
+                if len(audio_data) % bytes_per_frame != 0:
+                    raise TTSConfigError(
+                        f"Misaligned PCM audio chunk: buffer length {len(audio_data)} bytes is not a multiple "
+                        f"of frame size {bytes_per_frame} bytes ({sample_width} bytes/sample * {channels} channels)."
+                    )
+
+                # 6. Enforce format consistency across all chunks in the utterance
+                chunk_format = (sample_rate, sample_width, channels)
+                if initial_format is None:
+                    initial_format = chunk_format
+                    bytes_per_second = sample_rate * bytes_per_frame
                     max_bytes = int(self.config.tts_max_audio_duration_seconds * bytes_per_second)
+                elif chunk_format != initial_format:
+                    raise TTSConfigError(
+                        f"Audio chunk format changed mid-stream from {initial_format} (rate={initial_format[0]}, "
+                        f"width={initial_format[1]}, ch={initial_format[2]}) to {chunk_format} (rate={sample_rate}, "
+                        f"width={sample_width}, ch={channels})."
+                    )
 
+                # 7. Check cumulative audio duration bounds
                 total_bytes += len(audio_data)
                 if max_bytes is not None and total_bytes > max_bytes:
                     raise TTSConfigError(
@@ -425,7 +504,7 @@ class PiperTTSService:
                         f"{self.config.tts_max_audio_duration_seconds}s ({total_bytes} bytes)."
                     )
 
-                # Open sink with actual audio format reported by model
+                # 8. Open sink with validated audio format
                 if not sink_opened or not self.sink.is_active:
                     try:
                         self.sink.open(sample_rate=sample_rate, channels=channels)
@@ -433,7 +512,7 @@ class PiperTTSService:
                         self.sink.open()
                     sink_opened = True
 
-                # Write audio chunk to output sink
+                # 9. Write chunk to output sink
                 self.sink.write(audio_data)
 
         except Exception as exc:

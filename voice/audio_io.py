@@ -223,8 +223,13 @@ class SoundDeviceOutputSink(AudioOutputSink):
         self._active = False
 
     def open(self, sample_rate: int | None = None, channels: int | None = None) -> None:
-        target_rate = sample_rate or self.sample_rate
-        target_channels = channels or self.channels
+        target_rate = self.sample_rate if sample_rate is None else sample_rate
+        target_channels = self.channels if channels is None else channels
+
+        if not isinstance(target_rate, int) or target_rate <= 0:
+            raise AudioDeviceError(f"Invalid output sample rate {target_rate}: must be a positive integer.")
+        if target_channels != 1:
+            raise AudioDeviceError(f"Unsupported output channel count {target_channels}: only mono (1 channel) is supported.")
 
         if self._active and self._stream is not None:
             if self.sample_rate == target_rate and self.channels == target_channels:
@@ -284,6 +289,18 @@ class SoundDeviceOutputSink(AudioOutputSink):
     def write(self, pcm_data: bytes) -> None:
         if not self._active or self._stream is None:
             raise AudioWriteError("Cannot write to closed or inactive audio output sink.")
+
+        if not isinstance(pcm_data, (bytes, bytearray, memoryview)):
+            raise AudioWriteError("Audio data must be bytes-like.")
+
+        if len(pcm_data) == 0:
+            return
+
+        frame_size = 2 * self.channels
+        if len(pcm_data) % frame_size != 0:
+            raise AudioWriteError(
+                f"Audio buffer length {len(pcm_data)} bytes is not aligned to frame size {frame_size} bytes."
+            )
 
         try:
             self._stream.write(pcm_data)

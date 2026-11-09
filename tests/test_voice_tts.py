@@ -15,7 +15,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from voice.audio_io import AudioDeviceError, AudioOutputSink, AudioWriteError
+from voice.audio_io import (
+    AudioDeviceError,
+    AudioOutputSink,
+    AudioWriteError,
+    SoundDeviceOutputSink,
+)
 from voice.config import VoiceConfig
 from voice.tts import (
     PiperTTSService,
@@ -327,9 +332,9 @@ def test_oversized_text_rejected(base_tts_config):
 def test_streaming_chunks_delivered_in_order(base_tts_config):
     """Verify chunks from Piper streaming API are written to the sink in sequential order."""
     chunks = [
-        MockPiperChunk(audio_int16_bytes=b"CHUNK_1"),
-        MockPiperChunk(audio_int16_bytes=b"CHUNK_2"),
-        MockPiperChunk(audio_int16_bytes=b"CHUNK_3"),
+        MockPiperChunk(audio_int16_bytes=b"CHUNK_01"),
+        MockPiperChunk(audio_int16_bytes=b"CHUNK_02"),
+        MockPiperChunk(audio_int16_bytes=b"CHUNK_03"),
     ]
     mock_voice = MockPiperVoice(chunks=chunks)
     mock_sink = MockAudioOutputSink()
@@ -337,7 +342,7 @@ def test_streaming_chunks_delivered_in_order(base_tts_config):
     service = PiperTTSService(config=base_tts_config, sink=mock_sink, voice=mock_voice)
     service.speak("Test chunk order", non_blocking=False)
 
-    assert mock_sink.written_chunks == [b"CHUNK_1", b"CHUNK_2", b"CHUNK_3"]
+    assert mock_sink.written_chunks == [b"CHUNK_01", b"CHUNK_02", b"CHUNK_03"]
 
 
 def test_native_piper_sample_rate_and_format_preservation(base_tts_config):
@@ -613,7 +618,310 @@ def test_uncooperative_worker_timeout_during_stop(base_tts_config):
 
 
 # =============================================================================
-# 8. Configuration Bounds & Import Verification
+# 8. Deterministic Concurrency & Hardening Tests (Milestone 5.1.6.1)
+# =============================================================================
+
+def test_concurrent_speak_requests_cannot_overwrite_active_session(base_tts_config):
+    """Verify simultaneous speak() calls serialize cleanly without overwriting sessions."""
+    barrier = threading.Barrier(2)
+    mock_sink = MockAudioOutputSink(write_delay=0.01)
+    mock_voice = MockPiperVoice()
+    service = PiperTTSService(config=base_tts_config, sink=mock_sink, voice=mock_voice)
+
+    threads = []
+    errors = []
+
+    def call_speak(text):
+        try:
+            barrier.wait(timeout=2.0)
+            service.speak(text, non_blocking=True)
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=call_speak, args=("Utterance Alpha",))
+    t2 = threading.Thread(target=call_speak, args=("Utterance Beta",))
+    threads.extend([t1, t2])
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    # Wait for the winning/final playback to complete
+    deadline = time.time() + 3.0
+    while time.time() < deadline and service.is_speaking:
+        time.sleep(0.01)
+
+    assert service.is_speaking is False
+    assert mock_sink.max_concurrent_writers <= 1
+    assert service._session_counter == 2
+
+
+def test_previous_session_stopped_and_joined_before_next_session_begins(base_tts_config):
+    """Verify previous worker thread is confirmed terminated before new session begins."""
+    s1_started = threading.Event()
+    s1_unblock = threading.Event()
+    worker_1_ref = []
+    w1_was_alive_during_s2_start = []
+
+    class SteppedVoice:
+        def __init__(self):
+            self.sample_rate = 22050
+
+        def synthesize(self, text, syn_config=None):
+            if "Session 1" in text:
+                s1_started.set()
+                s1_unblock.wait(timeout=2.0)
+                yield MockPiperChunk(audio_int16_bytes=b"S1_CH01")
+            else:
+                # Session 2 verifies worker 1 is dead
+                if worker_1_ref and worker_1_ref[0].is_alive():
+                    w1_was_alive_during_s2_start.append(True)
+                yield MockPiperChunk(audio_int16_bytes=b"S2_CH01")
+
+    mock_sink = MockAudioOutputSink()
+    service = PiperTTSService(config=base_tts_config, sink=mock_sink, voice=SteppedVoice())
+
+    service.speak("Session 1", non_blocking=True)
+    assert s1_started.wait(timeout=2.0) is True
+
+    # Capture worker 1 thread
+    worker_1_ref.append(service._current_session.worker_thread)
+    assert worker_1_ref[0].is_alive() is True
+
+    # Unblock S1 so it can exit on cancellation
+    s1_unblock.set()
+
+    # Launch Session 2
+    service.speak("Session 2", non_blocking=True)
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline and service.is_speaking:
+        time.sleep(0.01)
+
+    assert not w1_was_alive_during_s2_start
+    assert worker_1_ref[0].is_alive() is False
+
+
+def test_concurrent_stop_and_speak_coordination(base_tts_config):
+    """Verify simultaneous stop() and speak() operations do not corrupt session ownership."""
+    barrier = threading.Barrier(2)
+    mock_sink = MockAudioOutputSink()
+    mock_voice = MockPiperVoice()
+    service = PiperTTSService(config=base_tts_config, sink=mock_sink, voice=mock_voice)
+
+    errors = []
+
+    def do_speak():
+        try:
+            barrier.wait(timeout=2.0)
+            service.speak("Concurrent race", non_blocking=True)
+        except Exception as e:
+            errors.append(e)
+
+    def do_stop():
+        try:
+            barrier.wait(timeout=2.0)
+            service.stop()
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=do_speak)
+    t2 = threading.Thread(target=do_stop)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors
+
+    # Clean up any active session if speak won after stop
+    if service.is_speaking:
+        service.stop()
+
+    assert service.is_speaking is False
+    assert mock_sink.max_concurrent_writers <= 1
+
+
+def test_uncooperative_worker_timeout_prevents_replacement_session(base_tts_config):
+    """Verify stubborn worker timeout prevents starting a replacement session and preserves worker ref."""
+    stubborn_lock = threading.Lock()
+    stubborn_lock.acquire()
+    entered_stubborn = threading.Event()
+
+    class StubbornVoice:
+        def __init__(self):
+            self.sample_rate = 22050
+
+        def synthesize(self, text, syn_config=None):
+            yield MockPiperChunk(audio_int16_bytes=b"HANG")
+            entered_stubborn.set()
+            stubborn_lock.acquire()
+
+    cfg = VoiceConfig(
+        tts_model_path=base_tts_config.tts_model_path,
+        tts_config_path=base_tts_config.tts_config_path,
+        tts_playback_join_timeout_seconds=0.1,
+    )
+    mock_sink = MockAudioOutputSink()
+    service = PiperTTSService(config=cfg, sink=mock_sink, voice=StubbornVoice())
+
+    service.speak("Stubborn session", non_blocking=True)
+    assert entered_stubborn.wait(timeout=2.0) is True
+
+    original_worker = service._current_session.worker_thread
+    assert original_worker.is_alive() is True
+
+    try:
+        with pytest.raises(TTSPlaybackError, match="previous session failed to terminate within timeout"):
+            service.speak("Replacement session", non_blocking=True)
+
+        # Confirm session was not overwritten by Replacement session
+        assert service._current_session.text == "Stubborn session"
+        assert service._current_session.worker_thread is original_worker
+    finally:
+        stubborn_lock.release()
+        service.stop()
+
+
+def test_blocking_playback_cancellable_from_another_thread(base_tts_config):
+    """Verify a blocking speak() call can be cancelled from another thread."""
+    started_playing = threading.Event()
+
+    class SlowVoice:
+        def __init__(self):
+            self.sample_rate = 22050
+
+        def synthesize(self, text, syn_config=None):
+            yield MockPiperChunk(audio_int16_bytes=b"SLOW_001")
+            started_playing.set()
+            for _ in range(10):
+                time.sleep(0.05)
+                yield MockPiperChunk(audio_int16_bytes=b"SLOW_002")
+
+    mock_sink = MockAudioOutputSink()
+    service = PiperTTSService(config=base_tts_config, sink=mock_sink, voice=SlowVoice())
+
+    def cancel_thread():
+        if started_playing.wait(timeout=2.0):
+            service.stop()
+
+    t_cancel = threading.Thread(target=cancel_thread)
+    t_cancel.start()
+
+    # Blocking call should return promptly once stop is called
+    start_time = time.time()
+    service.speak("Blocking slow speech", non_blocking=False)
+    elapsed = time.time() - start_time
+
+    t_cancel.join()
+    assert service.is_speaking is False
+    assert elapsed < 1.0  # Should abort well before 10 * 0.05s finishes
+
+
+def test_thread_start_failure_leaves_no_stale_session(base_tts_config):
+    """Verify thread start failure cleans up active-session state completely."""
+    mock_sink = MockAudioOutputSink()
+    mock_voice = MockPiperVoice()
+    service = PiperTTSService(config=base_tts_config, sink=mock_sink, voice=mock_voice)
+
+    with patch.object(threading.Thread, "start", side_effect=RuntimeError("Cannot start thread")):
+        with pytest.raises(TTSPlaybackError, match="Failed to start TTS worker thread"):
+            service.speak("Will fail thread start", non_blocking=True)
+
+    assert service.is_speaking is False
+    assert service._current_session is None
+    assert isinstance(service.last_error, RuntimeError)
+
+
+# =============================================================================
+# 9. Strict Audio Format Validation Tests (Milestone 5.1.6.1)
+# =============================================================================
+
+def test_invalid_sample_rate_rejected(base_tts_config):
+    """Verify non-positive or non-integer sample rates raise TTSConfigError."""
+    # Zero sample rate
+    zero_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_rate=0)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[zero_chunk]))
+    with pytest.raises(TTSConfigError, match="Invalid sample rate 0"):
+        service.speak("Bad sample rate", non_blocking=False)
+
+    # Negative sample rate
+    neg_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_rate=-22050)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[neg_chunk]))
+    with pytest.raises(TTSConfigError, match="Invalid sample rate -22050"):
+        service.speak("Bad sample rate", non_blocking=False)
+
+
+def test_unsupported_sample_width_rejected(base_tts_config):
+    """Verify non-16-bit sample widths raise TTSConfigError."""
+    bad_width_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_width=1)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[bad_width_chunk]))
+    with pytest.raises(TTSConfigError, match="Unsupported sample width 1"):
+        service.speak("Bad width", non_blocking=False)
+
+
+def test_unsupported_channel_count_rejected(base_tts_config):
+    """Verify multi-channel or zero-channel audio raises TTSConfigError."""
+    stereo_chunk = MockPiperChunk(audio_int16_bytes=b"DATA", sample_channels=2)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[stereo_chunk]))
+    with pytest.raises(TTSConfigError, match="Unsupported channel count 2"):
+        service.speak("Stereo rejected", non_blocking=False)
+
+
+def test_misaligned_pcm_byte_length_rejected(base_tts_config):
+    """Verify PCM byte lengths not aligned to 2 bytes raise TTSConfigError."""
+    odd_chunk = MockPiperChunk(audio_int16_bytes=b"ODD")
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[odd_chunk]))
+    with pytest.raises(TTSConfigError, match="Misaligned PCM audio chunk"):
+        service.speak("Odd byte length", non_blocking=False)
+
+
+def test_format_change_between_consecutive_chunks_rejected(base_tts_config):
+    """Verify changing audio format mid-stream raises TTSConfigError."""
+    c1 = MockPiperChunk(audio_int16_bytes=b"CH_A", sample_rate=22050)
+    c2 = MockPiperChunk(audio_int16_bytes=b"CH_B", sample_rate=16000)
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice(chunks=[c1, c2]))
+
+    with pytest.raises(TTSConfigError, match="Audio chunk format changed mid-stream"):
+        service.speak("Format changes mid stream", non_blocking=False)
+
+
+def test_sounddevice_sink_validates_audio_format():
+    """Verify SoundDeviceOutputSink rejects invalid sample rates, channels, and misaligned bytes."""
+    sink = SoundDeviceOutputSink()
+
+    # Invalid sample rate
+    with pytest.raises(AudioDeviceError, match="Invalid output sample rate 0"):
+        sink.open(sample_rate=0)
+
+    # Invalid channels
+    with pytest.raises(AudioDeviceError, match="Unsupported output channel count 2"):
+        sink.open(channels=2)
+
+    # Inactive write
+    with pytest.raises(AudioWriteError, match="Cannot write to closed or inactive"):
+        sink.write(b"DATA")
+
+
+def test_synthesis_config_construction_failure_surfaced(base_tts_config):
+    """Verify Piper synthesis config errors are surfaced as TTSConfigError."""
+    import sys
+    import types
+
+    service = PiperTTSService(config=base_tts_config, voice=MockPiperVoice())
+
+    mock_piper = types.ModuleType("piper")
+    mock_piper.SynthesisConfig = MagicMock(side_effect=ValueError("Invalid phoneme noise"))
+
+    with patch.dict(sys.modules, {"piper": mock_piper}):
+        with pytest.raises(TTSConfigError, match="Failed to construct Piper synthesis configuration"):
+            service.speak("Test syn config failure", non_blocking=False)
+
+
+# =============================================================================
+# 10. Configuration Bounds & Import Verification
 # =============================================================================
 
 def test_voice_config_tts_parameter_validation():
@@ -647,4 +955,5 @@ def test_import_voice_and_main_without_piper():
 
     assert PiperTTSService is not None
     assert VoiceConfig is not None
+
 

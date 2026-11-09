@@ -852,6 +852,56 @@ LONG-TERM MEMORY (Local SQLite)
     - Full-duplex barge-in orchestration (stopping TTS when user speaks or says wake word) is deferred to subsequent milestones.
     - Milestone 5.1.7 has not been started.
 
+- **Milestone 5.1.6.1**: Piper TTS Concurrency and Audio Format Hardening:
+  - **Purpose**: Fix TTS lifecycle race conditions, serialize speech requests and cancellation, enforce strict PCM audio format validation, and remove unsafe synthesis fallbacks.
+  - **Dedicated Request and Lifecycle Serialization**:
+    - Introduced `self._request_lock = threading.RLock()` in `PiperTTSService` with a documented two-tier lock ordering:
+      1. `_request_lock` (RLock): Serializes request admission, preemption, worker termination/joining, and session creation.
+      2. `_lifecycle_lock` (Lock): Protects session state variables (`_current_session`, `_is_speaking`, `_last_error`).
+      - Rule: Callers acquire `_request_lock` before `_lifecycle_lock`. A thread holding `_lifecycle_lock` never acquires `_request_lock`. Worker thread joins and event waits execute strictly outside `_lifecycle_lock`.
+    - Eliminated the race where two concurrent `speak()` callers could both observe no active session and overwrite `_current_session`.
+    - Coordinates `stop()` with `speak()` so preemption and cancellation follow deterministic ordering without deadlocks.
+    - Blocking playback runs outside `_request_lock`, allowing `stop()` from another thread to immediately signal `stop_event` and `sink.stop()`.
+    - Differentiates dedicated background worker threads (`worker.join()`) from caller-thread blocking sessions (`done_event.wait()`), preventing invalid thread joins on caller threads.
+    - Handled worker thread start failures: immediately resets `_current_session` and `_is_speaking`, sets `done_event`, records `last_error`, and raises `TTSPlaybackError`.
+    - Uncooperative worker timeout handling: preserves the active session and worker reference for post-mortem inspection, preventing replacement sessions from starting.
+  - **Strict PCM Audio Format Validation**:
+    - In `PiperTTSService._run_session()` and `SoundDeviceOutputSink`:
+      - `sample_rate`: Validated as a positive integer (>0).
+      - `sample_width`: Validated as exactly 2 bytes for the int16 playback backend.
+      - `sample_channels`: Validated as strictly mono (1 channel).
+      - PCM byte alignment: Validated that buffer length is an exact multiple of `sample_width * channels` (2 bytes). Odd or misaligned chunks are immediately rejected with `TTSConfigError`.
+      - Utterance Format Consistency: Enforced that all chunks within an utterance share identical `(sample_rate, sample_width, channels)`. Mid-stream format changes raise `TTSConfigError` without writing corrupted audio.
+      - Duration Limits: Accumulated and bounded using validated metadata.
+      - `SoundDeviceOutputSink`: Hardened `open(sample_rate, channels)` and `write(pcm_data)` to strictly validate positive rate, mono channel, and byte alignment.
+  - **Removal of Unsafe Synthesis Fallbacks**:
+    - Removed broad `except TypeError` retries that previously discarded synthesis configuration silently.
+    - Removed `synthesize_wav` full-waveform accumulation fallback; the official streaming `voice.synthesize(text, syn_config=...)` is the sole production path.
+    - `_build_synthesis_config()` raises `TTSConfigError` if `SynthesisConfig` construction fails rather than silently falling back to defaults.
+    - Injected test voice overrides can run without `piper` installed, but the real Piper path strictly enforces configuration and streaming contracts.
+  - **Testing & Verification**:
+    - `tests/test_voice_tts.py`: Expanded to 40 comprehensive tests (+13 new tests) using `threading.Barrier` and `threading.Event`:
+      - `test_concurrent_speak_requests_cannot_overwrite_active_session`: Verifies concurrent `speak()` calls serialize cleanly via Barrier.
+      - `test_previous_session_stopped_and_joined_before_next_session_begins`: Confirms prior worker thread is dead before replacement session writes audio.
+      - `test_concurrent_stop_and_speak_coordination`: Verifies concurrent `stop()` and `speak()` operations maintain coherent session ownership.
+      - `test_uncooperative_worker_timeout_prevents_replacement_session`: Verifies stubborn worker timeout prevents starting replacement session and preserves worker reference.
+      - `test_blocking_playback_cancellable_from_another_thread`: Verifies blocking `speak()` is safely interrupted and returns promptly on `stop()`.
+      - `test_thread_start_failure_leaves_no_stale_session`: Verifies thread start failure cleans up active-session state without leaking references.
+      - `test_invalid_sample_rate_rejected`: Tests zero and negative sample rates.
+      - `test_unsupported_sample_width_rejected`: Tests 8-bit and 32-bit sample widths.
+      - `test_unsupported_channel_count_rejected`: Tests multi-channel / stereo audio.
+      - `test_misaligned_pcm_byte_length_rejected`: Tests odd-byte PCM chunks.
+      - `test_format_change_between_consecutive_chunks_rejected`: Tests mid-stream format changes.
+      - `test_sounddevice_sink_validates_audio_format`: Tests backend sink format validation.
+      - `test_synthesis_config_construction_failure_surfaced`: Tests config errors are surfaced as `TTSConfigError`.
+    - Total voice subsystem tests: 227 passed in 152.10s.
+    - Total repository test suite: 494 passed in 239.78s with zero regressions.
+  - **Known Limitations & Phase Boundary**:
+    - Isolated to local Piper TTS foundation and audio output sink.
+    - No integration into main conversational loop or `main.py`.
+    - Barge-in full-duplex orchestration not started.
+    - Milestone 5.1.7 not started.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

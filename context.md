@@ -742,6 +742,41 @@ LONG-TERM MEMORY (Local SQLite)
     - Total voice subsystem tests: 180 passed in 84.48s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`, `test_voice_activation.py`).
     - Total repository test suite: 447 passed in 132.90s with zero regressions.
 
+- **Milestone 5.1.5.2**: Fail-Closed Startup Recovery and Real FIFO Handoff Verification:
+  - **Fail-Closed VoicePipeline Startup Failure Recovery**:
+    - When `voice_pipeline.start(clear_capture_buffer=False)` raises an exception, the orchestrator unconditionally attempts safe cleanup via `voice_pipeline.stop()`.
+    - Termination is verified using both public `is_running` contracts and inspection of underlying worker thread status (`_is_pipeline_active()`), ensuring partial initialization does not leave orphan worker threads competing for microphone frames.
+    - If cleanup succeeds and the pipeline is confirmed terminated:
+      - Publishes `COMMAND_FAILED` with the startup error.
+      - Resets the wake-word detector.
+      - Resumes wake-word standby cleanly.
+    - If cleanup raises, the pipeline remains active, or clean termination cannot be confirmed:
+      - Marks `self._pipeline_shutdown_failed = True`.
+      - Publishes `ACTIVATION_ERROR` with a descriptive explanation.
+      - Halts `AudioCaptureService` immediately.
+      - Breaks from the worker loop and never resumes standby.
+      - Preserves worker and pipeline references for post-mortem inspection.
+      - Enforces that subsequent or pending `stop()` calls report `VoiceActivationError`.
+  - **Fail-Closed Stale-Event Drainage**:
+    - **Initial Drainage**: If `voice_pipeline.clear_events()` raises during `orchestrator.start()`, startup fails cleanly with `VoiceActivationError`, publishes `ACTIVATION_ERROR`, and never starts microphone capture processing.
+    - **Per-Cycle Drainage**: If `voice_pipeline.clear_events()` raises after wake-word detection, the pipeline is never started, `ACTIVATION_ERROR` is published, `AudioCaptureService` is stopped, and activation terminates immediately rather than resuming standby with an untrusted queue.
+  - **Real VoicePipeline FIFO Handoff Verification**:
+    - Added deterministic integration test (`test_real_voice_pipeline_fifo_handoff_and_frame_preservation`) using the actual `VoicePipeline`, `VoiceActivationOrchestrator`, shared `MockAudioCaptureService`, and a recording fake VAD.
+    - Synchronized via threading events rather than arbitrary sleeps.
+    - Verified all post-wake frames are preserved across handoff and delivered to the pipeline's VAD exactly once and in strict FIFO order.
+    - Confirmed the wake frame itself is not reprocessed as command audio.
+    - Guaranteed cleanup of both workers in `finally:` blocks even on assertion failure.
+  - **Testing & Verification**:
+    - Added regression tests in `tests/test_voice_activation.py`:
+      - `test_voice_pipeline_startup_raises_and_cleanup_raises_fails_closed`
+      - `test_voice_pipeline_startup_partially_initializes_worker_fails_closed`
+      - `test_initial_clear_events_failure_fails_startup_cleanly`
+      - `test_per_cycle_clear_events_failure_fails_closed_and_stops_capture`
+      - `test_real_voice_pipeline_fifo_handoff_and_frame_preservation`
+    - Preserved existing multi-cycle stale-event drainage, shutdown failure, and event ordering tests.
+    - Total voice subsystem tests: 185 passed in 80.02s (`test_voice_audio_io.py`, `test_voice_vad.py`, `test_voice_stt.py`, `test_voice_pipeline.py`, `test_voice_wake_word.py`, `test_voice_activation.py`).
+    - Total repository test suite: 452 passed in 168.73s with zero regressions.
+
 ## Execution
 1. Activate venv: `.\.venv\Scripts\Activate.ps1`
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`

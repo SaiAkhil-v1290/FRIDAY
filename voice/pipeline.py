@@ -197,7 +197,8 @@ class VoicePipeline:
         session_to_stop: int = 0
 
         with self._lifecycle_lock:
-            if not self._running and not self._is_stopping:
+            worker_alive = self._worker_thread is not None and self._worker_thread.is_alive()
+            if not self._running and not self._is_stopping and not worker_alive:
                 logger.debug("VoicePipeline is already stopped; stop() ignored.")
                 return
 

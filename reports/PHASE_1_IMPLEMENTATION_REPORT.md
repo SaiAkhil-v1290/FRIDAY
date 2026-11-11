@@ -428,3 +428,4 @@ Phase 1 established the security foundation. Recommended Phase 2 priorities:
 4. **Deprecate `allow_approved=True`** — replace the legacy bypass with the structured `approval_id` path in all callers.
 5. **Rate limiting** — add per-tool and per-session rate limits to prevent runaway LLM-generated plans.
 6. **Sandboxed subprocess execution** — wrap `subprocess.Popen` calls in a restricted subprocess with explicit capability grants.
+

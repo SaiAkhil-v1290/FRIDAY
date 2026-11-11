@@ -216,10 +216,10 @@ class TestFileDiscovery(unittest.TestCase):
         self.assertFalse(res_unapproved.results[0].executed)
         self.assertEqual(res_unapproved.results[0].error, "APPROVAL_REQUIRED")
 
-        # Even with approval: delete_files remains unimplemented!
-        res_approved = executor.execute_plan(del_plan, allow_approved=True)
-        self.assertFalse(res_approved.results[0].executed)
-        self.assertEqual(res_approved.results[0].error, "EXECUTION_NOT_IMPLEMENTED")
+        # The legacy override cannot bypass approval enforcement.
+        res_override = executor.execute_plan(del_plan, allow_approved=True)
+        self.assertFalse(res_override.results[0].executed)
+        self.assertEqual(res_override.results[0].error, "APPROVAL_REQUIRED")
 
     def test_13_application_launch_regression(self):
         # Ensure open_application still works cleanly

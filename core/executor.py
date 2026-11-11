@@ -162,8 +162,9 @@ class PlanExecutor:
                         error="APPROVAL_INVALID",
                         requires_approval=True,
                     )
-            elif not allow_approved:
-                # No valid approval provided and general override not set
+            else:
+                # Security fix: the legacy allow_approved override is intentionally ignored.
+                # Approval-gated actions require an explicit ApprovalRequest ID, not a global bypass flag.
                 audit_logger.log(
                     "APPROVAL_HELD",
                     tool_name,

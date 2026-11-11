@@ -305,6 +305,19 @@ class TestPhase1Hardening(unittest.TestCase):
             self.assertFalse(res_approved.executed)
             self.assertEqual(res_approved.error, "EXECUTION_NOT_IMPLEMENTED")
 
+    def test_allow_approved_flag_cannot_bypass_approval(self):
+        executor = PlanExecutor()
+        action = ProposedAction(
+            tool="delete_files",
+            arguments={"folder": "Downloads", "pattern": "*"},
+            requires_approval=True,
+            reason="delete",
+        )
+
+        res = executor.execute_action(action, allow_approved=True)
+        self.assertFalse(res.executed)
+        self.assertEqual(res.error, "APPROVAL_REQUIRED")
+
     # =========================================================================
     # TASK 6: FILE ACCESS SECURITY HARDENING TESTS
     # =========================================================================

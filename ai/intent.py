@@ -1,6 +1,8 @@
 import re
 from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field
+
 IntentCategory = Literal[
     "continuation",
     "prompt_injection",
@@ -206,6 +208,24 @@ CONVERSATIONAL_STARTERS = (
     "how does",
     "why is",
 )
+
+
+class IntentClassificationResult(BaseModel):
+    """Intent result; confidence estimates rule specificity, not probability."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    intent: IntentCategory
+    confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Uncalibrated deterministic rule-specificity score, not a probability.",
+    )
+    requires_clarification: bool = False
+    rule_id: str
+    summary: str = ""
+    reason: str = ""
 
 
 def is_memory_recall_request(normalized_text: str) -> bool:
@@ -1821,7 +1841,7 @@ def extract_multi_step_actions(text: str) -> list[dict[str, object]] | None:
     return None
 
 
-def classify_intent(text: str) -> IntentCategory:
+def _classify_intent(text: str, rule_trace: list[str] | None = None) -> IntentCategory:
     """
     Classify user input following strict priority:
     1. Explicit continuation
@@ -1838,9 +1858,14 @@ def classify_intent(text: str) -> IntentCategory:
     12. Conversational question starters
     13. Normal conversation fallback
     """
+    def finish(intent: IntentCategory, rule_id: str) -> IntentCategory:
+        if rule_trace is not None:
+            rule_trace.append(rule_id)
+        return intent
+
     raw = text.strip()
     if not raw:
-        return "unclear"
+        return finish("unclear", "empty_input")
 
     # Normalize
     cleaned = re.sub(r"[^\w\s]", " ", raw.lower())
@@ -1849,110 +1874,147 @@ def classify_intent(text: str) -> IntentCategory:
     # 1. Explicit continuation
     for pat in CONTINUATION_PATTERNS:
         if re.search(pat, normalized):
-            return "continuation"
+            return finish("continuation", f"continuation_pattern:{pat}")
 
     # 2. Prompt injection overrides
     for pat in INJECTION_PATTERNS:
         if re.search(pat, normalized):
-            return "prompt_injection"
+            return finish("prompt_injection", f"injection_pattern:{pat}")
 
     # 3. Essential missing input (e.g. "run this Python code", "search for")
     if check_missing_input(normalized):
-        return "missing_input"
+        return finish("missing_input", "missing_input_pattern")
 
     # 4a. Explicit file discovery / content search commands (Precedence before generic web search)
     if extract_explicit_file_search_params(raw) is not None:
-        return "task"
+        return finish("task", "explicit_file_search_extractor")
 
     # 4b. Explicit open file / result selection commands (Precedence before memory/conversation)
     if extract_explicit_open_file_target(raw) is not None:
-        return "task"
+        return finish("task", "explicit_open_file_extractor")
 
     # 4c. Explicit open folder commands (Precedence before memory/conversation)
     if extract_explicit_open_folder_target(raw) is not None:
-        return "task"
+        return finish("task", "explicit_open_folder_extractor")
 
     # 4d. Explicit application lifecycle commands (close app / app status)
     if extract_explicit_close_app_target(raw) is not None:
-        return "task"
+        return finish("task", "explicit_close_application_extractor")
     if extract_explicit_app_status_target(raw) is not None:
-        return "task"
+        return finish("task", "explicit_application_status_extractor")
 
     # 4e. Conversational application lifecycle pronoun commands (Milestone 4D.5)
     if extract_conversational_application_action(raw) is not None:
-        return "task"
+        return finish("task", "conversational_application_action_extractor")
 
     # 4f. Explicit web search commands (Precedence over dangerous keywords in query)
     if extract_explicit_search_query(raw) is not None:
-        return "task"
+        return finish("task", "explicit_web_search_extractor")
 
     # 4g. Explicit browser navigation or control commands (Milestone 5.1)
     if extract_browser_navigation_target(raw) is not None:
-        return "task"
+        return finish("task", "browser_navigation_extractor")
     if extract_browser_control_action(raw) is not None:
-        return "task"
+        return finish("task", "browser_control_extractor")
 
     # 5. Explicit memory commands
     for pat in LONG_TERM_RECALL_PATTERNS:
         if re.search(pat, normalized):
-            return "memory_recall"
+            return finish("memory_recall", f"long_term_memory_recall_pattern:{pat}")
 
     for pat in MEMORY_STORE_PATTERNS:
         if re.search(pat, normalized):
-            return "memory_store"
+            return finish("memory_store", f"memory_store_pattern:{pat}")
 
     for pat in MEMORY_FORGET_PATTERNS:
         if re.search(pat, normalized):
-            return "memory_forget"
+            return finish("memory_forget", f"memory_forget_pattern:{pat}")
 
     # 6. Memory recall / historical conversation questions
     if is_memory_recall_request(normalized):
-        return "conversation"
+        return finish("conversation", "working_memory_recall_question")
 
     # 7. Ambiguous deletion requests (e.g. "start deleting old files")
     for pat in AMBIGUOUS_DELETION_PATTERNS:
         if re.search(pat, normalized):
-            return "unclear"
+            return finish("unclear", f"ambiguous_destructive_request_pattern:{pat}")
 
     # 8. Dangerous task triggers (for actual local actions, e.g. "delete all files in my Downloads folder")
     for pat in DANGEROUS_PATTERNS:
         if re.search(pat, normalized):
-            return "dangerous_task"
+            return finish("dangerous_task", f"dangerous_action_pattern:{pat}")
 
     # 9. Unclear / vague expressions
     for pat in UNCLEAR_PATTERNS:
         if re.search(pat, normalized):
-            return "unclear"
+            return finish("unclear", f"unclear_request_pattern:{pat}")
 
     # 10. Exact casual conversation matches
     if normalized in EXACT_CONVERSATIONS:
-        return "conversation"
+        return finish("conversation", "exact_conversation_match")
 
     # 11. Check conversational open phrases (e.g. "open to suggestions")
     if any(re.search(pat, normalized) for pat in CONVERSATIONAL_OPEN_PATTERNS):
-        return "conversation"
+        return finish("conversation", "conversational_open_phrase_pattern")
 
     # 12. Explicit task patterns
     for pat in TASK_PATTERNS:
         if re.search(pat, normalized):
-            return "task"
+            return finish("task", f"explicit_task_pattern:{pat}")
 
     # 13. Conversational question starters
     for starter in CONVERSATIONAL_STARTERS:
         if normalized.startswith(starter):
-            return "conversation"
+            return finish("conversation", f"conversational_question_starter:{starter.strip()}")
 
     # 14. Single-word inputs that are not tasks
     if " " not in normalized and len(normalized) <= 4:
-        return "conversation"
+        return finish("conversation", "short_single_token_conversation")
 
     # 15. Wh- questions without task verbs
     if normalized.startswith(("how", "what", "why", "who", "when", "where", "can you tell me")):
-        return "conversation"
+        return finish("conversation", "wh_question_without_task_verb")
 
     # 16. Fallback for short unclassified strings
     word_count = len(normalized.split())
     if word_count <= 3 and not any(v in normalized for v in ["open", "search", "find", "read", "create", "draft", "delete", "send", "look"]):
-        return "unclear"
+        return finish("unclear", "short_unclassified_input_fallback")
 
-    return "conversation"
+    return finish("conversation", "conversation_fallback")
+
+
+def classify_intent(text: str) -> IntentCategory:
+    """Preserve the original deterministic classification API."""
+    return _classify_intent(text)
+
+
+def classify_intent_structured(text: str) -> IntentClassificationResult:
+    """
+    Phase 2 foundation: return a structured result for explainable intent classification
+    while preserving the existing deterministic intent categories.
+    """
+    rule_trace: list[str] = []
+    intent = _classify_intent(text, rule_trace)
+    rule_id = rule_trace[0]
+    confidence = (
+        0.55 if rule_id in {"empty_input", "short_unclassified_input_fallback"}
+        else 0.75 if rule_id in {"conversation_fallback", "wh_question_without_task_verb"}
+        else 0.9
+    )
+
+    requires_clarification = intent in {"unclear", "missing_input"}
+    summary = f"Intent classified as '{intent}' by deterministic rule '{rule_id}'."
+    reason = (
+        f"Matched deterministic classification rule '{rule_id}'; this classifies intent only and does not authorize execution."
+        if not requires_clarification
+        else f"Matched deterministic clarification rule '{rule_id}'; resolve the missing or ambiguous input before action execution."
+    )
+
+    return IntentClassificationResult(
+        intent=intent,
+        confidence=confidence,
+        requires_clarification=requires_clarification,
+        rule_id=rule_id,
+        summary=summary,
+        reason=reason,
+    )

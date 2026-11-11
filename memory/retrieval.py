@@ -1,10 +1,19 @@
+import math
 import re
+from collections import OrderedDict
 from typing import Sequence
+
+from ollama import Client
+
+from config import settings
 from memory.long_term_memory import LongTermMemory
 from memory.models import Memory
 
 MAX_RETRIEVED_MEMORIES = 5
 MAX_MEMORY_CHARS = 1200
+MAX_SEMANTIC_CANDIDATES = 500
+MAX_CACHED_MEMORY_EMBEDDINGS = 512
+EMBEDDING_BATCH_SIZE = 32
 
 # Common English stop words to ignore when tokenizing queries for candidate search
 STOP_WORDS = {
@@ -40,6 +49,7 @@ class MemoryRetriever:
 
     def __init__(self, long_term_memory: LongTermMemory) -> None:
         self.ltm = long_term_memory
+        self._memory_embedding_cache: OrderedDict[tuple[str, str, int, str], tuple[float, ...]] = OrderedDict()
 
     def tokenize_request(self, text: str) -> list[str]:
         """Normalize and tokenize text into meaningful non-stop keywords."""
@@ -122,6 +132,162 @@ class MemoryRetriever:
             total_chars += len(mem.content)
 
         return selected
+
+    @staticmethod
+    def _cosine_similarity(left: list[float], right: list[float]) -> float:
+        if not left or not right:
+            return 0.0
+        if len(left) != len(right):
+            return 0.0
+        if not all(math.isfinite(value) for value in (*left, *right)):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(a * a for a in left))
+        right_norm = math.sqrt(sum(b * b for b in right))
+        if left_norm == 0 or right_norm == 0:
+            return 0.0
+        return max(-1.0, min(1.0, dot / (left_norm * right_norm)))
+
+    def _embed_memory(self, client: Client, memory: Memory) -> list[float]:
+        cache_key = (settings.ollama_host, settings.embedding_model, memory.id, memory.updated_at)
+        cached = self._memory_embedding_cache.get(cache_key)
+        if cached is not None:
+            self._memory_embedding_cache.move_to_end(cache_key)
+            return list(cached)
+
+        response = client.embed(model=settings.embedding_model, input=[memory.content])
+        vector = response["embeddings"][0]
+        if not vector or not all(math.isfinite(float(value)) for value in vector):
+            raise ValueError("Embedding response contained an invalid vector.")
+        stored_vector = tuple(float(value) for value in vector)
+        self._memory_embedding_cache[cache_key] = stored_vector
+        self._memory_embedding_cache.move_to_end(cache_key)
+        while len(self._memory_embedding_cache) > MAX_CACHED_MEMORY_EMBEDDINGS:
+            self._memory_embedding_cache.popitem(last=False)
+        return list(stored_vector)
+
+    def _embed_memories(self, client: Client, memories: list[Memory]) -> dict[int, list[float]]:
+        vectors: dict[int, list[float]] = {}
+        uncached: list[Memory] = []
+        for memory in memories:
+            cache_key = (settings.ollama_host, settings.embedding_model, memory.id, memory.updated_at)
+            cached = self._memory_embedding_cache.get(cache_key)
+            if cached is None:
+                uncached.append(memory)
+            else:
+                self._memory_embedding_cache.move_to_end(cache_key)
+                vectors[memory.id] = list(cached)
+
+        for start in range(0, len(uncached), EMBEDDING_BATCH_SIZE):
+            batch = uncached[start:start + EMBEDDING_BATCH_SIZE]
+            try:
+                response = client.embed(
+                    model=settings.embedding_model,
+                    input=[memory.content for memory in batch],
+                )
+                embeddings = response["embeddings"]
+                if len(embeddings) != len(batch):
+                    raise ValueError("Embedding response count did not match candidate count.")
+                for memory, vector in zip(batch, embeddings):
+                    if not vector or not all(math.isfinite(float(value)) for value in vector):
+                        continue
+                    stored_vector = tuple(float(value) for value in vector)
+                    cache_key = (settings.ollama_host, settings.embedding_model, memory.id, memory.updated_at)
+                    self._memory_embedding_cache[cache_key] = stored_vector
+                    self._memory_embedding_cache.move_to_end(cache_key)
+                    vectors[memory.id] = list(stored_vector)
+            except Exception:
+                # Retry individually so one bad record cannot discard valid candidates.
+                for memory in batch:
+                    try:
+                        vectors[memory.id] = self._embed_memory(client, memory)
+                    except Exception:
+                        continue
+
+            while len(self._memory_embedding_cache) > MAX_CACHED_MEMORY_EMBEDDINGS:
+                self._memory_embedding_cache.popitem(last=False)
+
+        return vectors
+
+    def retrieve_with_semantic_fallback(
+        self,
+        request_text: str,
+        limit: int = MAX_RETRIEVED_MEMORIES,
+    ) -> list[Memory]:
+        """
+        Run bounded semantic retrieval even without keyword overlap. Successfully embedded semantic
+        candidates rank first by cosine similarity; keyword-ranked records are appended afterward,
+        with IDs deduplicated and the original Memory records preserved. If the request embedding
+        fails, keyword retrieval remains the safe fallback.
+        """
+        raw_request = (request_text or "").strip()
+        if not raw_request:
+            return []
+
+        keyword_results = self.retrieve(request_text, limit=limit)
+        candidates = self.ltm.list_memories(limit=MAX_SEMANTIC_CANDIDATES)
+        if not candidates:
+            return []
+
+        try:
+            client = Client(host=settings.ollama_host, timeout=settings.request_timeout)
+            request_response = client.embed(
+                model=settings.embedding_model,
+                input=[raw_request],
+            )
+            request_vector = request_response["embeddings"][0]
+            if not request_vector or not all(math.isfinite(float(value)) for value in request_vector):
+                return keyword_results
+        except Exception:
+            return keyword_results
+
+        candidate_vectors = self._embed_memories(
+            client,
+            [memory for memory in candidates if memory.content.strip()],
+        )
+        scored: list[tuple[float, Memory]] = []
+        for memory in candidates:
+            memory_vector = candidate_vectors.get(memory.id)
+            if memory_vector is None:
+                continue
+            similarity = self._cosine_similarity(
+                [float(value) for value in request_vector],
+                memory_vector,
+            )
+            if similarity > 0.0:
+                scored.append((similarity, memory))
+
+        if not candidate_vectors or not scored:
+            return keyword_results
+
+        scored.sort(key=lambda item: (-item[0], -item[1].id))
+        semantic_ids: set[int] = set()
+        merged: list[Memory] = []
+        total_chars = 0
+
+        for _, memory in scored:
+            if memory.id in semantic_ids:
+                continue
+            semantic_ids.add(memory.id)
+            if len(merged) >= limit:
+                break
+            if total_chars + len(memory.content) > MAX_MEMORY_CHARS:
+                continue
+            merged.append(memory)
+            total_chars += len(memory.content)
+
+        for memory in keyword_results:
+            if memory.id in semantic_ids or len(merged) >= limit:
+                continue
+            semantic_ids.add(memory.id)
+            if total_chars + len(memory.content) > MAX_MEMORY_CHARS:
+                continue
+            merged.append(memory)
+            total_chars += len(memory.content)
+
+        if not merged:
+            return keyword_results
+        return merged
 
     @staticmethod
     def format_retrieval_context(memories: Sequence[Memory]) -> str:

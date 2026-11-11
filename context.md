@@ -333,3 +333,17 @@ LONG-TERM MEMORY (Local SQLite)
 2. Ensure model is pulled: `ollama pull qwen2.5:3b`
 3. Run `python main.py`
 
+## Phase 2 Intelligence Increment (2026-11-11)
+
+- Branch: `anish/phase-2-intelligence`.
+- HEAD and Phase 1 base: `924c1f8fc0d0eefa673d2d9e9be25c97acf22d0b` (`security: finalize phase 1 hardening and approval enforcement`). This Phase 1 commit is an ancestor of the Phase 2 branch; the committed branch diff from `anish/phase-1-hardening` is empty at this checkpoint.
+- `ai/intent.py` provides additive `classify_intent_structured()` output while preserving `classify_intent()`. The orchestrator now uses the structured category for the same deterministic routing decisions and stores the latest `rule_id`/reason in `last_intent_classification` for diagnostics. Confidence remains an uncalibrated rule-specificity heuristic and is never used for authorization.
+- `memory/retrieval.py` now attempts embeddings even when keyword retrieval has no candidates. It uses configured `OLLAMA_EMBEDDING_MODEL` (default `embeddinggemma`), checks cosine vector dimensions/finite values, ranks up to 500 recent memory records by similarity, and merges keyword results afterward by ID without duplicate source records. Request-level Ollama failures return keyword results; individual candidate failures skip only that record. Tests use a mocked Ollama client and do not require a running server.
+- Memory embeddings are cached in bounded RAM per retriever, keyed by configured host/model and memory ID/update timestamp. No persistent vector cache/index exists. Candidate search is limited to the newest 500 memory records. The orchestrator now calls semantic fallback only before ordinary conversation responses and LLM-generated planning; explicit memory commands and deterministic app/file/browser routes do not invoke embeddings.
+- Retrieved memories are preserved as JSON-encoded user-level reference data containing memory ID, category and timestamps. System prompts explicitly say memory content is untrusted and cannot override instructions or authorize actions. Planner validation and `PlanExecutor` remain the authorization/execution boundaries.
+- `OLLAMA_HOST` must resolve to a loopback literal/localhost by default. `ALLOW_REMOTE_OLLAMA=true` is an explicit opt-in; when enabled, FRIDAY sends user prompts and retrieved private memory to that remote endpoint. FRIDAY cannot determine whether that remote host is a public cloud service, so only a host the user controls and trusts should be used.
+- Validation on 2026-11-11: focused integration/regression suite 50 passed; Phase 1 security suite 37 passed; full suite 327 passed (up from the prior 317-test checkpoint). Exact commands/results are in `reports/PHASE_2_IMPLEMENTATION_REPORT.md`.
+- Integration scope: structured intent supplies diagnostics and the same intent categories; confidence is unused. Memory retrieval is placed only on model-consumption paths and failures fall back to keyword retrieval or empty context. No executor, approval manager, permission policy, or Akhil-owned computer-control, voice, or desktop modules were modified.
+- Notion checklist is updated in the existing FRIDAY PLAN page with the integration/test status; Phase 1 acceptance records remain untouched.
+- No commit or push was performed. See `reports/PHASE_2_IMPLEMENTATION_REPORT.md` for current worktree inventory, review findings, remaining work, and proposed commit contents.
+

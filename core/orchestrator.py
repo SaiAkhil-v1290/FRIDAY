@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from security.permissions import approval_manager
 from ai.intent import (
-    classify_intent,
+    classify_intent_structured,
+    IntentClassificationResult,
     extract_explicit_open_app_target,
     extract_explicit_close_app_target,
     extract_explicit_app_status_target,
@@ -65,11 +66,36 @@ class JarvisOrchestrator:
         self.grounder = memory_grounder or MemoryGrounder()
         self.executor = plan_executor or PlanExecutor()
         self.debug_retrieval = debug_retrieval
+        self.last_intent_classification: IntentClassificationResult | None = None
 
     def check_connection(self) -> None:
         self.llm.check_connection()
 
+    def _retrieve_grounded_memory_context(self, user_text: str) -> tuple[list[Memory], str]:
+        try:
+            retrieved_memories = self.retriever.retrieve_with_semantic_fallback(user_text)
+        except Exception:
+            try:
+                retrieved_memories = self.retriever.retrieve(user_text)
+            except Exception:
+                retrieved_memories = []
+
+        is_fact = self.grounder.is_memory_fact_query(user_text)
+        is_sugg = self.grounder.is_suggestion_query(user_text)
+        missing_aspect = self.grounder.detect_missing_aspect(user_text, retrieved_memories)
+        memory_context = self.grounder.format_grounded_memory_context(
+            memories=retrieved_memories,
+            is_fact_query=is_fact,
+            is_suggestion=is_sugg,
+            missing_aspect=missing_aspect,
+        )
+
+        if self.debug_retrieval and retrieved_memories:
+            print(f"[DEBUG Retrieval] Found {len(retrieved_memories)} relevant memories for query.")
+        return retrieved_memories, memory_context
+
     def handle(self, user_text: str, allow_approved: bool = False) -> AssistantResult:
+        self.last_intent_classification = None
         stripped_lower = user_text.strip().lower()
 
         # Handle explicit approval / rejection commands
@@ -109,7 +135,10 @@ class JarvisOrchestrator:
                 plan = TaskPlan(intent="approval_rejected", message=msg, actions=[], risk_level="low")
                 return AssistantResult(message=msg, plan=plan)
 
-        intent = classify_intent(user_text)
+        self.last_intent_classification = classify_intent_structured(user_text)
+        intent = self.last_intent_classification.intent
+        retrieved_memories: list[Memory] = []
+        memory_context = ""
         cleaned_norm = " ".join(re.sub(r"[^\w\s]", " ", user_text.lower()).split())
 
         # 1. Prompt injection / adversarial override defense
@@ -360,23 +389,6 @@ class JarvisOrchestrator:
                 exec_res = self.executor.execute_plan(plan, allow_approved=allow_approved)
                 return AssistantResult(message=plan_msg, plan=plan, execution_result=exec_res)
 
-        retrieved_memories = self.retriever.retrieve(user_text)
-
-        # Apply deterministic grounding evaluation (Milestone 2D)
-        is_fact = self.grounder.is_memory_fact_query(user_text)
-        is_sugg = self.grounder.is_suggestion_query(user_text)
-        missing_aspect = self.grounder.detect_missing_aspect(user_text, retrieved_memories)
-
-        memory_context = self.grounder.format_grounded_memory_context(
-            memories=retrieved_memories,
-            is_fact_query=is_fact,
-            is_suggestion=is_sugg,
-            missing_aspect=missing_aspect,
-        )
-
-        if self.debug_retrieval and retrieved_memories:
-            print(f"[DEBUG Retrieval] Found {len(retrieved_memories)} relevant memories for query.")
-
         # 6. Conversation
         if intent == "conversation":
             # Check for follow-up file search clarification (Bug 4)
@@ -420,6 +432,7 @@ class JarvisOrchestrator:
                 exec_res = self.executor.execute_plan(plan, allow_approved=allow_approved)
                 return AssistantResult(message=plan.message, plan=plan, execution_result=exec_res)
 
+            retrieved_memories, memory_context = self._retrieve_grounded_memory_context(user_text)
             answer = self.conversation.respond(
                 conversation_history=self.memory.messages,
                 current_request=user_text,
@@ -1255,6 +1268,7 @@ class JarvisOrchestrator:
                     )
             else:
                 # LLM planning for general tasks (only reached if no deterministic file/search/folder/app command matched)
+                retrieved_memories, memory_context = self._retrieve_grounded_memory_context(user_text)
                 raw_plan = self.llm.create_plan(
                     conversation_history=self.memory.messages,
                     current_request=user_text,

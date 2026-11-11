@@ -143,7 +143,9 @@ Copy `.env.example` to `.env` and edit as needed:
 # Ollama connection
 OLLAMA_HOST=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen2.5:3b
+OLLAMA_EMBEDDING_MODEL=embeddinggemma
 OLLAMA_TIMEOUT=120
+ALLOW_REMOTE_OLLAMA=false
 
 # Conversation
 MAX_HISTORY_MESSAGES=12
@@ -159,6 +161,12 @@ APPROVAL_TIMEOUT_SECONDS=300
 URLs, non-numeric numbers, or out-of-range values produce a clear error and
 halt startup. Secrets are never echoed in logs or error messages.
 
+Ollama hosts must be loopback by default. Setting `ALLOW_REMOTE_OLLAMA=true`
+explicitly permits a non-loopback endpoint. FRIDAY then sends prompts and any
+retrieved private-memory text to that configured host. Use only a remote host
+you control and trust; the application cannot determine whether a remote host
+is a public cloud service.
+
 ---
 
 ## Running the tests
@@ -168,7 +176,7 @@ halt startup. Secrets are never echoed in logs or error messages.
 python -m unittest discover -s tests -v
 ```
 
-Expected result: `Ran 303 tests` — `OK` (0 failures, 0 errors).
+Verified on 2026-11-11: see `reports/PHASE_2_IMPLEMENTATION_REPORT.md` for the latest full-suite result.
 
 ---
 
@@ -214,10 +222,32 @@ Expected result: `Ran 303 tests` — `OK` (0 failures, 0 errors).
 
 ---
 
-## Phase 2 preview
+## Phase 2 status
 
-The next phase will add:
-- Persistent audit log (SQLite)
-- Persistent approval store (survive restart)
-- Semantic memory and vector search over long-term memory
-- Rate limiting per tool and per session
+Phase 2 is in progress on `anish/phase-2-intelligence`, based on Phase 1 commit
+`924c1f8fc0d0eefa673d2d9e9be25c97acf22d0b`.
+
+- Structured intent classification is available through
+  `classify_intent_structured()`. The orchestrator uses its deterministic intent
+  category for the existing route decisions and exposes the latest `rule_id` and
+  rationale through `last_intent_classification`. Confidence is a deterministic
+  rule-specificity heuristic, not a probability, and is never used for approval.
+- `MemoryRetriever.retrieve_with_semantic_fallback()` embeds the query and up to
+  500 recent local memory records using the configured Ollama embedding model
+  (default `embeddinggemma`). Semantic candidates are ordered by cosine
+  similarity; deduplicated keyword results are appended. Ollama request failures
+  fall back to keyword retrieval, and individual memory failures skip that
+  candidate. Mocked tests prove semantic-only recall without an Ollama server.
+- Memory embeddings are cached in bounded process memory by host, model, memory
+  ID, and update timestamp. The orchestrator uses semantic fallback only before
+  ordinary conversational responses and LLM-planned tasks. Explicit memory
+  commands and deterministic application/file/browser routes bypass embedding
+  work. Memory records are JSON-encoded user-level reference data, not system
+  policy; embedded instructions cannot authorize tools or bypass approval.
+  Persistent vector caching/indexing and end-to-end live-model evaluation remain
+  open, so semantic memory is integrated but not yet complete.
+- Persistent audit storage, persistent approvals, and per-tool/session rate
+  limiting remain planned work; they are not implemented by this checkpoint.
+
+The Phase 2 verification report is in
+[`reports/PHASE_2_IMPLEMENTATION_REPORT.md`](reports/PHASE_2_IMPLEMENTATION_REPORT.md).

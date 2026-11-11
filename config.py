@@ -1,5 +1,6 @@
 import os
 import re
+import ipaddress
 from dataclasses import dataclass
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -89,6 +90,29 @@ def _validate_string(raw_val: str | None, default: str, var_name: str) -> str:
     return cleaned
 
 
+def _validate_bool(raw_val: str | None, default: bool, var_name: str) -> bool:
+    if raw_val is None or str(raw_val).strip() == "":
+        return default
+    normalized = str(raw_val).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(
+        f"Invalid boolean value '{raw_val}' for '{var_name}'. Expected true or false."
+    )
+
+
+def _is_loopback_host(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True)
 class Settings:
     ollama_host: str
@@ -100,6 +124,8 @@ class Settings:
     max_extracted_chars_per_doc: int = 500_000        # 500k characters max
     max_extraction_units_per_doc: int = 5_000         # 5k slides/cells/units max
     approval_timeout_seconds: float = 300.0           # 5 minutes approval window
+    embedding_model: str = "embeddinggemma"
+    allow_remote_ollama: bool = False
 
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
@@ -110,7 +136,21 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     get_env = env.get if env is not None else os.getenv
 
     host = _validate_url(get_env("OLLAMA_HOST", "http://127.0.0.1:11434"), "OLLAMA_HOST")
+    allow_remote_ollama = _validate_bool(
+        get_env("ALLOW_REMOTE_OLLAMA", "false"), False, "ALLOW_REMOTE_OLLAMA"
+    )
+    if not _is_loopback_host(host) and not allow_remote_ollama:
+        raise ConfigurationError(
+            "OLLAMA_HOST is not a loopback address. Set ALLOW_REMOTE_OLLAMA=true only "
+            "if you explicitly consent to sending prompts and retrieved private memory "
+            "to that configured host."
+        )
     model = _validate_string(get_env("OLLAMA_MODEL", "qwen2.5:3b"), "qwen2.5:3b", "OLLAMA_MODEL")
+    embedding_model = _validate_string(
+        get_env("OLLAMA_EMBEDDING_MODEL", "embeddinggemma"),
+        "embeddinggemma",
+        "OLLAMA_EMBEDDING_MODEL",
+    )
     timeout = _validate_float(get_env("OLLAMA_TIMEOUT", "120"), 120.0, "OLLAMA_TIMEOUT", min_val=1.0, max_val=3600.0)
     history = _validate_int(get_env("MAX_HISTORY_MESSAGES", "12"), 12, "MAX_HISTORY_MESSAGES", min_val=1, max_val=1000)
 
@@ -152,6 +192,8 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         max_extracted_chars_per_doc=max_chars,
         max_extraction_units_per_doc=max_units,
         approval_timeout_seconds=approval_timeout,
+        embedding_model=embedding_model,
+        allow_remote_ollama=allow_remote_ollama,
     )
 
 
